@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+requests
+numpy
+scikit-learn
+xgboost
+weaviate-client
+sentence-transformers
+openai
+python-dotenv
+joblib
