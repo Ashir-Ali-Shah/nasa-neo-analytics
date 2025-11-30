@@ -1,5 +1,3 @@
-Here is a `README.md` file incorporating the quantitative metrics from your results. I've formatted it to be professional, clear, and informative for anyone viewing your project on GitHub.
-
 # 🌌 NASA NEO Analytics & Hazard Prediction 🚀
 
 A full-stack planetary defense analytics platform that tracks Near-Earth Objects (asteroids) using NASA's NeoWs API. It features an interactive dashboard for real-time tracking, an AI chatbot for data analysis, and a high-performance Machine Learning model to predict hazardous asteroids.
