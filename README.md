@@ -60,14 +60,15 @@ Which physical properties make an asteroid dangerous? The model found **Absolute
 ### 1. Clone & Configure
 
 git clone [[https://github.com/Ashir-Ali-Shah/nasa-project.git](https://github.com/Ashir-Ali-Shah/nasa-project.git)]
+
 cd nasa-project
 
 # Create a .env file in the backend folder
 echo "NASA_API_KEY=your_key_here" > backend/.env
+
 echo "OPENROUTER_API_KEY=your_key_here" >> backend/.env
+
 2. Launch with Docker
 Run the entire stack (Frontend + Backend + Database) with one command:
-
-Bash
 
 docker compose up --build
