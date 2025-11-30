@@ -101,7 +101,3 @@ The model was trained on data fetched dynamically from NASA.
   * **Hazardous Distribution:** \~90% Safe / \~10% Hazardous
   * **Missing Values:** Imputed using mean strategy.
   * **Scaling:** Standard Scaler applied to all numerical features.
-
-
-```
-```
