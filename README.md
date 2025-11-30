@@ -1,25 +1,73 @@
-# NASA NEO Analytics Dashboard 🚀
+# 🌌 NASA NEO (Near Earth Object) Analytics & Hazard Prediction 🚀
 
-A full-stack application that tracks Near-Earth Objects (asteroids) using NASA data, Machine Learning for hazard prediction, and an AI chatbot.
+A full-stack planetary defense analytics platform that tracks Near-Earth Objects (asteroids) using NASA's NeoWs API. It features an interactive dashboard for real-time tracking, an AI chatbot for data analysis, and a high-performance Machine Learning model to predict hazardous asteroids.
+
+## 📊 Model Performance Metrics
+
+The core of this project is an **XGBoost Classifier** trained on **127,347** historic asteroid records to predict if a new object is potentially hazardous.
+
+### Key Results
+* **Overall Accuracy:** **94.18%** 🎯
+* **Total Records Analyzed:** 127,347
+* **Test Set Size:** 25,470 samples (20% split)
+
+### Detailed Classification Report
+The dataset is **imbalanced** (far more non-hazardous asteroids than hazardous ones), so `Accuracy` alone is not enough. We prioritize **Recall** for the `True` class (hazardous) to minimize missed threats.
+
+| Class | Precision | Recall | F1-Score | Support |
+| :--- | :---: | :---: | :---: | :---: |
+| **False** (Safe) | 0.95 | 0.99 | 0.97 | 23,693 |
+| **True** (Hazardous) | **0.74** | **0.25** | **0.38** | **1,777** |
+| | | | | |
+| **Macro Avg** | 0.84 | 0.62 | 0.67 | 25,470 |
+| **Weighted Avg** | 0.93 | 0.94 | 0.93 | 25,470 |
+
+* **Precision (0.74):** When the model says an asteroid is hazardous, it is correct 74% of the time.
+* **Recall (0.25):** The model correctly identified 25% of all actual hazardous asteroids in the test set. *Future work aims to improve this using techniques like SMOTE or class weighting.*
+
+### Confusion Matrix
+| | Predicted Safe | Predicted Hazardous |
+| :--- | :---: | :---: |
+| **Actual Safe** | **23,535** (TN) | 158 (FP) |
+| **Actual Hazardous** | 1,324 (FN) | **453** (TP) |
+
+### 🧠 Feature Importance
+Which physical properties make an asteroid dangerous? The model found **Absolute Magnitude** (brightness/size) to be the single most critical factor.
+
+| Rank | Feature | Importance Score |
+| :--- | :--- | :--- |
+| 1 | **Absolute Magnitude** | **0.7001** |
+| 2 | Estimated Diameter (Min) | 0.1216 |
+| 3 | Miss Distance | 0.0871 |
+| 4 | Estimated Diameter (Max) | 0.0469 |
+| 5 | Relative Velocity | 0.0444 |
+
+---
 
 ## 🛠️ Tech Stack
-- **Frontend:** React, Recharts
-- **Backend:** FastAPI, Python, XGBoost
-- **AI:** RAG System
+* **Frontend:** React, Recharts (Data Visualization), Tailwind CSS
+* **Backend:** FastAPI, Python, Weaviate (Vector DB)
+* **Machine Learning:** XGBoost, Scikit-Learn, Pandas
+* **AI:** RAG System (Retrieval-Augmented Generation) with OpenRouter/LLM integration
+* **DevOps:** Docker, Docker Compose
 
 ## ⚙️ How to Run
 
-### 1. Backend
-```bash
-cd backend
-pip install -r requirements.txt
-# Create a .env file here with your NASA_API_KEY and OPENROUTER_API_KEY
-uvicorn main:app --reload
-```
+### Prerequisites
+* Docker & Docker Compose installed
+* API Keys for NASA and OpenRouter
 
-### 2. Frontend
-```bash
-cd frontend
-npm install
-npm run dev
-```
+### 1. Clone & Configure
+
+git clone [[https://github.com/Ashir-Ali-Shah/nasa-project.git](https://github.com/Ashir-Ali-Shah/nasa-project.git)]
+cd nasa-project
+
+# Create a .env file in the backend folder
+echo "NASA_API_KEY=your_key_here" > backend/.env
+echo "OPENROUTER_API_KEY=your_key_here" >> backend/.env
+2. Launch with Docker
+Run the entire stack (Frontend + Backend + Database) with one command:
+
+Bash
+
+docker compose up --build
