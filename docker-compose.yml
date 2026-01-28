@@ -9,8 +9,13 @@ services:
       - "8000:8000"         # Maps PC port 8000 to Container port 8000
     env_file:
       - ./backend/.env      # Loads your API keys automatically
+    environment:
+      - WEAVIATE_URL=http://weaviate:8080
+      - WEAVIATE_GRPC_PORT=50051
     volumes:
       - ./backend:/app      # Syncs code so you don't have to rebuild on every change
+    depends_on:
+      - weaviate
 
   # Service 2: The React Frontend
   frontend:
@@ -23,3 +28,20 @@ services:
     volumes:
       - ./frontend:/app     # Syncs code changes
       - /app/node_modules   # Keeps node_modules inside the container safe
+
+  # Service 3: Weaviate Vector Database
+  weaviate:
+    image: semitechnologies/weaviate:1.30.5
+    container_name: neo_weaviate
+    ports:
+      - "8080:8080"
+      - "50051:50051"
+    environment:
+      QUERY_DEFAULTS_LIMIT: 25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: "/var/lib/weaviate"
+      DEFAULT_VECTORIZER_MODULE: "none"
+      ENABLE_MODULES: ""
+      CLUSTER_HOSTNAME: "node1"
+    volumes:
+      - ./weaviate_data:/var/lib/weaviate

@@ -14,12 +14,18 @@ import traceback
 import json
 from openai import OpenAI
 from collections import defaultdict
+from urllib.parse import urlparse
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Try to import Weaviate, but don't fail if not available
 try:
     import weaviate
     from weaviate.classes.init import Auth
     from weaviate.classes.query import MetadataQuery
+    from weaviate.classes.config import Property, DataType
     WEAVIATE_AVAILABLE = True
 except ImportError:
     WEAVIATE_AVAILABLE = False
@@ -54,7 +60,9 @@ EARTH_RADIUS_KM = 6371
 LUNAR_DISTANCE_KM = 384400
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-CHAT_MODEL = "qwen/qwen-2.5-7b-instruct"
+CHAT_MODEL = os.getenv("CHAT_MODEL", "qwen/qwen-2.5-7b-instruct")
+WEAVIATE_URL = os.getenv("WEAVIATE_URL")
+WEAVIATE_GRPC_PORT = os.getenv("WEAVIATE_GRPC_PORT")
 
 openrouter_client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
@@ -84,26 +92,36 @@ def init_weaviate():
         print("\n" + "="*70)
         print("INITIALIZING WEAVIATE")
         print("="*70)
-        
-        # Try embedded mode first
-        try:
-            weaviate_client = weaviate.WeaviateClient(
-                embedded_options=weaviate.embedded.EmbeddedOptions(
-                    persistence_data_path="./weaviate_data",
-                    binary_path="./weaviate_binary"
-                )
-            )
+
+        # Prefer explicit Weaviate URL if provided
+        if WEAVIATE_URL:
+            parsed = urlparse(WEAVIATE_URL)
+            host = parsed.hostname or "localhost"
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            grpc_port = int(WEAVIATE_GRPC_PORT) if WEAVIATE_GRPC_PORT else 50051
+            weaviate_client = weaviate.connect_to_local(host=host, port=port, grpc_port=grpc_port)
             weaviate_client.connect()
-            print("✓ Weaviate embedded mode connected")
-        except Exception as embed_error:
-            print(f"Embedded mode failed: {str(embed_error)}")
-            # Try connecting to local instance
+            print(f"✓ Connected to Weaviate at {host}:{port}")
+        else:
+            # Try embedded mode first
             try:
-                weaviate_client = weaviate.connect_to_local()
-                print("✓ Connected to local Weaviate instance")
-            except Exception as local_error:
-                print(f"Local connection failed: {str(local_error)}")
-                raise Exception("Could not connect to Weaviate. Please install Weaviate or use fallback mode.")
+                weaviate_client = weaviate.WeaviateClient(
+                    embedded_options=weaviate.embedded.EmbeddedOptions(
+                        persistence_data_path="./weaviate_data",
+                        binary_path="./weaviate_binary"
+                    )
+                )
+                weaviate_client.connect()
+                print("✓ Weaviate embedded mode connected")
+            except Exception as embed_error:
+                print(f"Embedded mode failed: {str(embed_error)}")
+                # Try connecting to local instance
+                try:
+                    weaviate_client = weaviate.connect_to_local()
+                    print("✓ Connected to local Weaviate instance")
+                except Exception as local_error:
+                    print(f"Local connection failed: {str(local_error)}")
+                    raise Exception("Could not connect to Weaviate. Please install Weaviate or use fallback mode.")
         
         # Create schema if needed
         try:
@@ -155,17 +173,17 @@ def create_neo_schema():
         weaviate_client.collections.create(
             name="NEODocument",
             properties=[
-                {"name": "content", "dataType": ["text"]},
-                {"name": "neo_id", "dataType": ["int"]},
-                {"name": "name", "dataType": ["text"]},
-                {"name": "date", "dataType": ["text"]},
-                {"name": "risk_score", "dataType": ["number"]},
-                {"name": "risk_category", "dataType": ["text"]},
-                {"name": "diameter_km", "dataType": ["number"]},
-                {"name": "velocity_kms", "dataType": ["number"]},
-                {"name": "miss_distance_km", "dataType": ["number"]},
-                {"name": "kinetic_energy_mt", "dataType": ["number"]},
-                {"name": "is_hazardous", "dataType": ["boolean"]}
+                Property(name="content", data_type=DataType.TEXT),
+                Property(name="neo_id", data_type=DataType.INT),
+                Property(name="name", data_type=DataType.TEXT),
+                Property(name="date", data_type=DataType.TEXT),
+                Property(name="risk_score", data_type=DataType.NUMBER),
+                Property(name="risk_category", data_type=DataType.TEXT),
+                Property(name="diameter_km", data_type=DataType.NUMBER),
+                Property(name="velocity_kms", data_type=DataType.NUMBER),
+                Property(name="miss_distance_km", data_type=DataType.NUMBER),
+                Property(name="kinetic_energy_mt", data_type=DataType.NUMBER),
+                Property(name="is_hazardous", data_type=DataType.BOOL)
             ],
             vectorizer_config=None
         )
@@ -282,6 +300,7 @@ class RiskScoredNEO(BaseModel):
     is_hazardous: bool
     risk_category: str
     follow_up_priority: str
+    absolute_magnitude: Optional[float] = None
 
 class ImpactAnalysis(BaseModel):
     neo_id: int
@@ -560,7 +579,8 @@ async def get_advanced_analytics(days: int = 30):
             miss_distance_km=neo.miss_distance,
             is_hazardous=neo.is_hazardous,
             risk_category=risk_cat,
-            follow_up_priority=priority
+            follow_up_priority=priority,
+            absolute_magnitude=neo.absolute_magnitude
         ))
     
     scored_neos.sort(key=lambda x: x.risk_score, reverse=True)
@@ -707,6 +727,161 @@ async def get_model_status():
         "ready_for_predictions": xgb_model is not None and scaler is not None,
         "last_load_error": model_load_error
     }
+
+@app.get("/api/neo/model-metrics")
+async def get_model_metrics():
+    """Get ML model performance metrics dynamically"""
+    if xgb_model is None:
+        raise HTTPException(status_code=503, detail="ML model not loaded")
+    
+    try:
+        # Get model parameters and compute metrics dynamically
+        model_params = {}
+        training_samples = 0
+        
+        # Extract info from XGBoost model
+        try:
+            # Get number of boosting rounds (trees)
+            n_estimators = xgb_model.n_estimators if hasattr(xgb_model, 'n_estimators') else 100
+            
+            # Get model configuration
+            if hasattr(xgb_model, 'get_params'):
+                model_params = xgb_model.get_params()
+            
+            # Try to get training info from booster
+            if hasattr(xgb_model, 'get_booster'):
+                booster = xgb_model.get_booster()
+                # Get number of trees
+                n_estimators = booster.num_boosted_rounds() if hasattr(booster, 'num_boosted_rounds') else n_estimators
+        except Exception as e:
+            print(f"Error getting model params: {e}")
+        
+        # Calculate metrics based on model's internal validation scores if available
+        # These are computed from cross-validation during training
+        # For a production system, these would be stored with the model
+        
+        # Get feature importances to determine model quality indicators
+        importances = xgb_model.feature_importances_
+        max_importance = float(max(importances))
+        importance_variance = float(np.var(importances))
+        
+        # Estimate metrics based on model characteristics
+        # In production, these should be saved during training and loaded here
+        # For now, we compute approximations based on model properties
+        
+        # Check if model has best_score from training
+        best_score = None
+        if hasattr(xgb_model, 'best_score'):
+            best_score = xgb_model.best_score
+        
+        # Get objective function to understand what was optimized
+        objective = model_params.get('objective', 'binary:logistic')
+        
+        # Return dynamic metrics
+        # Note: In a production system, save these during training
+        metrics = {
+            "model_type": "XGBoost Classifier",
+            "n_estimators": n_estimators,
+            "max_depth": model_params.get('max_depth', 6),
+            "learning_rate": model_params.get('learning_rate', 0.1),
+            "objective": objective,
+            "feature_count": len(importances),
+            "max_feature_importance": max_importance,
+            "importance_variance": importance_variance,
+            "model_loaded": True,
+            "scaler_loaded": scaler is not None,
+            # Performance metrics - these should be computed during training
+            # and stored with the model. For demonstration, we use the model's
+            # internal cross-validation if available
+            "performance": {
+                "note": "Metrics computed from model cross-validation during training",
+                "data_source": "NASA NeoWs Historical Database"
+            }
+        }
+        
+        # Try to load saved metrics if they exist
+        metrics_paths = ['model_metrics.json', './model_metrics.json', 
+                        '../model_metrics.json', './models/model_metrics.json']
+        
+        for path in metrics_paths:
+            if os.path.exists(path):
+                try:
+                    with open(path, 'r') as f:
+                        saved_metrics = json.load(f)
+                        metrics["performance"] = saved_metrics
+                        metrics["metrics_source"] = "saved_file"
+                        break
+                except Exception as e:
+                    print(f"Error loading metrics from {path}: {e}")
+        
+        # If no saved metrics, compute from model if possible
+        if "accuracy" not in metrics.get("performance", {}):
+            # These values should ideally come from saved training metrics
+            # Computing actual metrics requires the test dataset
+            metrics["performance"] = {
+                "note": "For accurate metrics, run model evaluation with test data",
+                "model_ready": True,
+                "features_trained": 5,
+                "feature_names": [
+                    "Absolute Magnitude",
+                    "Estimated Diameter (Min)", 
+                    "Estimated Diameter (Max)",
+                    "Relative Velocity",
+                    "Miss Distance"
+                ]
+            }
+            metrics["metrics_source"] = "model_properties"
+        
+        return metrics
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get model metrics: {str(e)}")
+
+@app.get("/api/neo/feature-importance")
+async def get_feature_importance():
+    """Get feature importance from the XGBoost model"""
+    if xgb_model is None:
+        raise HTTPException(status_code=503, detail="ML model not loaded")
+    
+    try:
+        # Feature names in the order they were trained
+        feature_names = [
+            "Absolute Magnitude",
+            "Estimated Diameter (Min)",
+            "Estimated Diameter (Max)",
+            "Relative Velocity",
+            "Miss Distance"
+        ]
+        
+        # Get feature importances from the model
+        importances = xgb_model.feature_importances_
+        
+        # Create sorted list of features by importance
+        feature_importance_list = []
+        for name, importance in zip(feature_names, importances):
+            feature_importance_list.append({
+                "feature": name,
+                "importance": float(importance),
+                "percentage": float(importance * 100)
+            })
+        
+        # Sort by importance descending
+        feature_importance_list.sort(key=lambda x: x["importance"], reverse=True)
+        
+        # Add rank
+        for i, item in enumerate(feature_importance_list):
+            item["rank"] = i + 1
+        
+        return {
+            "feature_importances": feature_importance_list,
+            "model_type": "XGBoost Classifier",
+            "total_features": len(feature_names),
+            "top_feature": feature_importance_list[0]["feature"] if feature_importance_list else None,
+            "description": "Feature importance scores indicate how much each feature contributes to the model's hazard predictions. Higher scores mean greater influence on determining if an asteroid is potentially hazardous."
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get feature importance: {str(e)}")
 
 @app.get("/api/rag/kb-status")
 async def get_kb_status():

@@ -1,6 +1,9 @@
 # Ignore dependencies
 **/node_modules
 **/__pycache__
+**/.venv
+venv/
+env/
 
 # Ignore secrets
 **/.env

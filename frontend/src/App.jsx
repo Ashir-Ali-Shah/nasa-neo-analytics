@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { LineChart, Line, BarChart, Bar, ScatterChart, Scatter, PieChart, Pie, Cell, XAxis, YAxis, Tooltip, Legend, ResponsiveContainer, ComposedChart, Area, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar } from 'recharts';
-import { Activity, Database, AlertTriangle, Rocket, Target, TrendingUp, MapPin, Zap, CheckCircle, XCircle, Loader, Eye, Map, Building, Radio, Telescope, RefreshCw } from 'lucide-react';
+import { Activity, Database, AlertTriangle, Rocket, Target, TrendingUp, MapPin, Zap, CheckCircle, XCircle, Loader, Eye, Map, Building, Radio, Telescope, RefreshCw, Brain, BarChart3 } from 'lucide-react';
 import Swal from 'sweetalert2';
 import withReactContent from 'sweetalert2-react-content';
 
@@ -34,12 +34,51 @@ const AdvancedNEODashboard = () => {
   const [autoIndexing, setAutoIndexing] = useState(false);
 
   const [selectedNEO, setSelectedNEO] = useState(null);
+  
+  const [featureImportance, setFeatureImportance] = useState(null);
+  const [featureImportanceLoading, setFeatureImportanceLoading] = useState(false);
+  const [modelMetrics, setModelMetrics] = useState(null);
+  const [modelMetricsLoading, setModelMetricsLoading] = useState(false);
 
   useEffect(() => {
     fetchAdvancedData();
     checkModelStatus();
     checkKnowledgeBaseStatus();
+    fetchFeatureImportance();
+    fetchModelMetrics();
   }, [days]);
+
+  const fetchModelMetrics = async () => {
+    setModelMetricsLoading(true);
+    try {
+      const response = await fetch(`${API_BASE}/api/neo/model-metrics`);
+      if (response.ok) {
+        const data = await response.json();
+        setModelMetrics(data);
+        console.log('Model Metrics:', data);
+      }
+    } catch (err) {
+      console.error('Error fetching model metrics:', err);
+    } finally {
+      setModelMetricsLoading(false);
+    }
+  };
+
+  const fetchFeatureImportance = async () => {
+    setFeatureImportanceLoading(true);
+    try {
+      const response = await fetch(`${API_BASE}/api/neo/feature-importance`);
+      if (response.ok) {
+        const data = await response.json();
+        setFeatureImportance(data);
+        console.log('Feature Importance:', data);
+      }
+    } catch (err) {
+      console.error('Error fetching feature importance:', err);
+    } finally {
+      setFeatureImportanceLoading(false);
+    }
+  };
 
   const checkModelStatus = async () => {
     try {
@@ -284,7 +323,7 @@ const AdvancedNEODashboard = () => {
   const loadSampleNEO = (neo) => {
     if (neo) {
       setPredictionInput({
-        absolute_magnitude: 22.0,
+        absolute_magnitude: neo.absolute_magnitude || 22.0,
         estimated_diameter_min: neo.diameter_km * 0.9,
         estimated_diameter_max: neo.diameter_km * 1.1,
         relative_velocity: neo.velocity_kms * 3600,
@@ -447,13 +486,13 @@ const AdvancedNEODashboard = () => {
             <Activity className="text-blue-400 mb-2" size={32} />
             <p className="text-blue-600 text-sm mb-1 font-medium">High-Risk Periods</p>
             <p className="text-4xl font-bold text-blue-500">
-              {data.temporal_clusters ? data.temporal_clusters.filter(c => c.is_high_risk_period).length : 0}
+              {data.temporal_clusters ? data.temporal_clusters.length : 0}
             </p>
           </div>
         </div>
 
         <div className="flex gap-2 mb-6 overflow-x-auto pb-2">
-          {['risk', 'statistical-analysis', 'impact', 'predict', 'chat'].map((tab) => (
+          {['risk', 'statistical-analysis', 'impact', 'model', 'predict', 'chat'].map((tab) => (
             <button
               key={tab}
               onClick={() => setActiveTab(tab)}
@@ -463,7 +502,7 @@ const AdvancedNEODashboard = () => {
                   : 'bg-white text-indigo-600 border border-indigo-100 hover:bg-indigo-50'
               }`}
             >
-              {tab === 'predict' ? 'ML Prediction' : tab === 'chat' ? 'Ask AI' : tab.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')}
+              {tab === 'predict' ? 'ML Prediction' : tab === 'chat' ? 'Ask AI' : tab === 'model' ? 'Model Insights' : tab.split('-').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')}
             </button>
           ))}
         </div>
@@ -1408,6 +1447,261 @@ const AdvancedNEODashboard = () => {
                   </div>
                 </div>
               ))}
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'model' && (
+          <div className="space-y-6">
+            {/* Model Performance Metrics */}
+            <div className="bg-white rounded-2xl p-6 border-2 border-indigo-100 shadow-lg">
+              <div className="flex items-center gap-3 mb-6">
+                <Brain className="text-indigo-500" size={32} />
+                <div>
+                  <h3 className="text-2xl font-bold text-slate-800">Model Performance Metrics</h3>
+                  <p className="text-slate-600">
+                    {modelMetrics?.model_type || 'XGBoost Classifier'} trained on {modelMetrics?.performance?.training_samples?.toLocaleString() || '...'} historic asteroid records
+                  </p>
+                </div>
+              </div>
+
+              {modelMetricsLoading ? (
+                <div className="flex items-center justify-center h-32">
+                  <Loader className="animate-spin text-indigo-500" size={40} />
+                </div>
+              ) : modelMetrics?.performance ? (
+                <>
+                  <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+                    <div className="bg-gradient-to-br from-green-50 to-emerald-50 rounded-xl p-5 border border-green-200">
+                      <p className="text-green-700 text-sm font-medium mb-1">Accuracy</p>
+                      <p className="text-3xl font-bold text-green-800">
+                        {modelMetrics.performance.accuracy ? `${(modelMetrics.performance.accuracy * 100).toFixed(1)}%` : 'N/A'}
+                      </p>
+                      <p className="text-xs text-green-600 mt-1">Overall prediction accuracy</p>
+                    </div>
+                    <div className="bg-gradient-to-br from-blue-50 to-indigo-50 rounded-xl p-5 border border-blue-200">
+                      <p className="text-blue-700 text-sm font-medium mb-1">Precision</p>
+                      <p className="text-3xl font-bold text-blue-800">
+                        {modelMetrics.performance.precision ? `${(modelMetrics.performance.precision * 100).toFixed(1)}%` : 'N/A'}
+                      </p>
+                      <p className="text-xs text-blue-600 mt-1">True positive rate</p>
+                    </div>
+                    <div className="bg-gradient-to-br from-purple-50 to-violet-50 rounded-xl p-5 border border-purple-200">
+                      <p className="text-purple-700 text-sm font-medium mb-1">Recall</p>
+                      <p className="text-3xl font-bold text-purple-800">
+                        {modelMetrics.performance.recall ? `${(modelMetrics.performance.recall * 100).toFixed(1)}%` : 'N/A'}
+                      </p>
+                      <p className="text-xs text-purple-600 mt-1">Hazardous detection rate</p>
+                    </div>
+                    <div className="bg-gradient-to-br from-amber-50 to-orange-50 rounded-xl p-5 border border-amber-200">
+                      <p className="text-amber-700 text-sm font-medium mb-1">F1 Score</p>
+                      <p className="text-3xl font-bold text-amber-800">
+                        {modelMetrics.performance.f1_score ? `${(modelMetrics.performance.f1_score * 100).toFixed(1)}%` : 'N/A'}
+                      </p>
+                      <p className="text-xs text-amber-600 mt-1">Harmonic mean</p>
+                    </div>
+                  </div>
+
+                  {modelMetrics.performance.roc_auc && (
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+                      <div className="bg-gradient-to-br from-cyan-50 to-sky-50 rounded-xl p-4 border border-cyan-200">
+                        <p className="text-cyan-700 text-sm font-medium mb-1">ROC-AUC</p>
+                        <p className="text-2xl font-bold text-cyan-800">{(modelMetrics.performance.roc_auc * 100).toFixed(1)}%</p>
+                      </div>
+                      <div className="bg-gradient-to-br from-rose-50 to-pink-50 rounded-xl p-4 border border-rose-200">
+                        <p className="text-rose-700 text-sm font-medium mb-1">Test Samples</p>
+                        <p className="text-2xl font-bold text-rose-800">{modelMetrics.performance.test_samples?.toLocaleString() || 'N/A'}</p>
+                      </div>
+                      <div className="bg-gradient-to-br from-teal-50 to-emerald-50 rounded-xl p-4 border border-teal-200">
+                        <p className="text-teal-700 text-sm font-medium mb-1">CV Folds</p>
+                        <p className="text-2xl font-bold text-teal-800">{modelMetrics.performance.cross_validation_folds || 'N/A'}</p>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="bg-indigo-50 rounded-xl p-4 border border-indigo-200">
+                    <p className="text-indigo-900 text-sm">
+                      <span className="font-semibold">Training Data:</span> The model was trained on {modelMetrics.performance.training_samples?.toLocaleString() || 'N/A'} historical asteroid records from {modelMetrics.performance.data_source || 'NASA NeoWs database'}, 
+                      with features including absolute magnitude, diameter estimates, relative velocity, and miss distance. 
+                      {modelMetrics.performance.class_balance_method && ` The dataset was balanced using ${modelMetrics.performance.class_balance_method} to handle the class imbalance between hazardous and non-hazardous asteroids.`}
+                      {modelMetrics.performance.training_date && ` Model trained on ${modelMetrics.performance.training_date}.`}
+                    </p>
+                  </div>
+                </>
+              ) : (
+                <div className="bg-yellow-50 rounded-xl p-4 border border-yellow-200">
+                  <p className="text-yellow-800 text-sm">
+                    <span className="font-semibold">Note:</span> Model metrics not available. Ensure the backend is running and the model is loaded.
+                  </p>
+                </div>
+              )}
+            </div>
+
+            {/* Feature Importance Section */}
+            <div className="bg-white rounded-2xl p-6 border-2 border-purple-100 shadow-lg">
+              <div className="flex items-center gap-3 mb-6">
+                <BarChart3 className="text-purple-500" size={32} />
+                <div>
+                  <h3 className="text-2xl font-bold text-slate-800">Feature Importance Analysis</h3>
+                  <p className="text-slate-600">Which physical properties make an asteroid dangerous?</p>
+                </div>
+              </div>
+
+              {featureImportanceLoading ? (
+                <div className="flex items-center justify-center h-64">
+                  <Loader className="animate-spin text-purple-500" size={40} />
+                </div>
+              ) : featureImportance ? (
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                  {/* Bar Chart */}
+                  <div>
+                    <h4 className="text-lg font-semibold text-slate-700 mb-4">Importance Distribution</h4>
+                    <ResponsiveContainer width="100%" height={350}>
+                      <BarChart 
+                        data={featureImportance.feature_importances} 
+                        layout="vertical"
+                        margin={{ top: 5, right: 30, left: 20, bottom: 5 }}
+                      >
+                        <XAxis 
+                          type="number" 
+                          domain={[0, 1]}
+                          tick={{ fill: '#64748B', fontSize: 12 }}
+                          axisLine={{ stroke: '#E2E8F0' }}
+                          tickLine={{ stroke: '#E2E8F0' }}
+                          tickFormatter={(value) => `${(value * 100).toFixed(0)}%`}
+                        />
+                        <YAxis 
+                          type="category" 
+                          dataKey="feature"
+                          tick={{ fill: '#475569', fontSize: 12, fontWeight: 500 }}
+                          axisLine={{ stroke: '#E2E8F0' }}
+                          tickLine={{ stroke: '#E2E8F0' }}
+                          width={150}
+                        />
+                        <Tooltip 
+                          contentStyle={{ 
+                            backgroundColor: 'white', 
+                            border: '2px solid #E2E8F0',
+                            borderRadius: '12px',
+                            padding: '12px',
+                            boxShadow: '0 4px 6px rgba(0,0,0,0.1)'
+                          }}
+                          formatter={(value) => [`${(value * 100).toFixed(2)}%`, 'Importance']}
+                        />
+                        <Bar 
+                          dataKey="importance" 
+                          radius={[0, 8, 8, 0]}
+                        >
+                          {featureImportance.feature_importances.map((entry, index) => (
+                            <Cell 
+                              key={`cell-${index}`} 
+                              fill={index === 0 ? '#8B5CF6' : index === 1 ? '#A78BFA' : index === 2 ? '#C4B5FD' : index === 3 ? '#DDD6FE' : '#EDE9FE'}
+                            />
+                          ))}
+                        </Bar>
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+
+                  {/* Table */}
+                  <div>
+                    <h4 className="text-lg font-semibold text-slate-700 mb-4">Feature Ranking</h4>
+                    <div className="bg-slate-50 rounded-xl overflow-hidden border border-slate-200">
+                      <table className="w-full">
+                        <thead>
+                          <tr className="bg-purple-100">
+                            <th className="text-left py-3 px-4 text-sm font-bold text-purple-900">Rank</th>
+                            <th className="text-left py-3 px-4 text-sm font-bold text-purple-900">Feature</th>
+                            <th className="text-right py-3 px-4 text-sm font-bold text-purple-900">Importance Score</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {featureImportance.feature_importances.map((item, idx) => (
+                            <tr 
+                              key={item.feature} 
+                              className={`border-b border-slate-200 ${idx === 0 ? 'bg-purple-50' : 'bg-white'} hover:bg-purple-50 transition-colors`}
+                            >
+                              <td className="py-3 px-4">
+                                <div className={`w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm ${
+                                  idx === 0 ? 'bg-purple-600 text-white' : 'bg-slate-200 text-slate-700'
+                                }`}>
+                                  {item.rank}
+                                </div>
+                              </td>
+                              <td className="py-3 px-4">
+                                <span className={`font-semibold ${idx === 0 ? 'text-purple-700' : 'text-slate-700'}`}>
+                                  {item.feature}
+                                </span>
+                              </td>
+                              <td className="py-3 px-4 text-right">
+                                <span className={`font-bold text-lg ${idx === 0 ? 'text-purple-700' : 'text-slate-700'}`}>
+                                  {item.importance.toFixed(4)}
+                                </span>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    {/* Key Finding */}
+                    <div className="mt-4 p-4 bg-gradient-to-r from-purple-100 to-indigo-100 rounded-xl border border-purple-200">
+                      <div className="flex items-start gap-3">
+                        <div className="bg-purple-500 text-white rounded-full p-2 flex-shrink-0">
+                          <Target size={16} />
+                        </div>
+                        <div>
+                          <p className="font-bold text-purple-900 mb-1">Key Finding</p>
+                          <p className="text-sm text-purple-800">
+                            <strong>{featureImportance.feature_importances[0]?.feature || 'Top Feature'}</strong> {featureImportance.feature_importances[0]?.feature === 'Absolute Magnitude' ? '(brightness/size indicator)' : ''} is the single most critical factor 
+                            in determining asteroid hazard potential, accounting for approximately <strong>{(featureImportance.feature_importances[0]?.importance * 100).toFixed(0)}%</strong> of the model's 
+                            decision-making weight.
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex items-center justify-center h-64 bg-slate-50 rounded-xl border-2 border-dashed border-slate-200">
+                  <div className="text-center">
+                    <BarChart3 className="w-16 h-16 text-slate-300 mx-auto mb-3" />
+                    <p className="text-slate-600 font-semibold">Feature importance data not available</p>
+                    <p className="text-slate-500 text-sm mt-1">Ensure the ML model is loaded in the backend</p>
+                  </div>
+                </div>
+              )}
+
+              {/* Interpretation Guide */}
+              <div className="mt-6 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                <div className="p-4 bg-purple-50 rounded-xl border border-purple-200">
+                  <h5 className="font-bold text-purple-900 mb-2 flex items-center gap-2">
+                    <span className="bg-purple-600 text-white rounded-full w-6 h-6 flex items-center justify-center text-xs">1</span>
+                    Absolute Magnitude
+                  </h5>
+                  <p className="text-sm text-purple-800">
+                    Lower values indicate larger, brighter asteroids. Objects with H &lt; 22 are considered potentially hazardous by size alone.
+                  </p>
+                </div>
+                <div className="p-4 bg-indigo-50 rounded-xl border border-indigo-200">
+                  <h5 className="font-bold text-indigo-900 mb-2 flex items-center gap-2">
+                    <span className="bg-indigo-600 text-white rounded-full w-6 h-6 flex items-center justify-center text-xs">2</span>
+                    Diameter Estimates
+                  </h5>
+                  <p className="text-sm text-indigo-800">
+                    Size directly correlates with impact energy. Asteroids &gt;140m diameter can cause regional devastation.
+                  </p>
+                </div>
+                <div className="p-4 bg-blue-50 rounded-xl border border-blue-200">
+                  <h5 className="font-bold text-blue-900 mb-2 flex items-center gap-2">
+                    <span className="bg-blue-600 text-white rounded-full w-6 h-6 flex items-center justify-center text-xs">3</span>
+                    Miss Distance & Velocity
+                  </h5>
+                  <p className="text-sm text-blue-800">
+                    Closer approaches with higher velocities increase impact probability and kinetic energy transfer.
+                  </p>
+                </div>
+              </div>
             </div>
           </div>
         )}
