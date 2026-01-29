@@ -12,10 +12,12 @@ services:
     environment:
       - WEAVIATE_URL=http://weaviate:8080
       - WEAVIATE_GRPC_PORT=50051
+      - REDIS_URL=redis://redis:6379/0  # Redis connection for caching
     volumes:
       - ./backend:/app      # Syncs code so you don't have to rebuild on every change
     depends_on:
       - weaviate
+      - redis               # Ensure Redis starts before backend
 
   # Service 2: The React Frontend
   frontend:
@@ -45,3 +47,21 @@ services:
       CLUSTER_HOSTNAME: "node1"
     volumes:
       - ./weaviate_data:/var/lib/weaviate
+
+  # Service 4: Redis Cache (Look-Aside Caching for NASA API)
+  redis:
+    image: redis:7-alpine
+    container_name: neo_redis
+    ports:
+      - "6379:6379"         # Expose Redis port for local debugging
+    volumes:
+      - redis_data:/data    # Persistent storage survives container restarts
+    command: redis-server --appendonly yes  # Enable AOF persistence
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  redis_data:               # Named volume for Redis persistence

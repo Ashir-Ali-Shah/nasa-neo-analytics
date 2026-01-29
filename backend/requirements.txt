@@ -9,3 +9,5 @@ sentence-transformers
 openai
 python-dotenv
 joblib
+redis>=5.0.0
+httpx>=0.27.0

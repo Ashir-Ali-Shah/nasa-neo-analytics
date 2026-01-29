@@ -12,6 +12,7 @@ import joblib
 import os
 import traceback
 import json
+import asyncio
 from openai import OpenAI
 from collections import defaultdict
 from urllib.parse import urlparse
@@ -19,6 +20,16 @@ from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Import caching layer and NASA service
+from core.cache import (
+    cache_response, 
+    get_cache_stats, 
+    clear_cache, 
+    get_cached_keys_info,
+    get_redis_client
+)
+from services.nasa_service import NasaService
 
 # Try to import Weaviate, but don't fail if not available
 try:
@@ -354,7 +365,7 @@ class RAGQueryResponse(BaseModel):
 
 # Helper functions
 def fetch_nasa_data(start_date: str, end_date: str) -> dict:
-    """Fetch data from NASA API"""
+    """Fetch data from NASA API (synchronous fallback)"""
     params = {
         'start_date': start_date,
         'end_date': end_date,
@@ -366,6 +377,19 @@ def fetch_nasa_data(start_date: str, end_date: str) -> dict:
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=500, detail=f"NASA API error: {str(e)}")
+
+
+async def fetch_nasa_data_cached(start_date: str, end_date: str) -> dict:
+    """
+    Fetch data from NASA API with Redis caching.
+    
+    This is the primary method that should be used for all NASA API calls.
+    It uses the NasaService which has the @cache_response decorator applied.
+    """
+    try:
+        return await NasaService.fetch_asteroid_feed(start_date, end_date)
+    except Exception as e:
         raise HTTPException(status_code=500, detail=f"NASA API error: {str(e)}")
 
 def parse_neo_data(api_response: dict) -> List[NEOData]:
@@ -481,55 +505,92 @@ async def root():
     else:
         kb_count = len(neo_documents)
     
+    # Check Redis cache status
+    redis_connected = False
+    try:
+        client = await get_redis_client()
+        redis_connected = client is not None
+    except:
+        pass
+    
     return {
         "status": "online",
         "service": "NASA NEO Advanced Analytics API",
-        "version": "4.0.1",
+        "version": "4.1.0",  # Version bump for caching feature
         "ml_models_loaded": {
             "xgboost": xgb_model is not None,
             "scaler": scaler is not None
         },
         "weaviate_connected": weaviate_client is not None,
+        "redis_cache_connected": redis_connected,
         "semantic_search_enabled": embedding_model is not None,
         "knowledge_base_documents": kb_count,
         "ready_for_predictions": xgb_model is not None and scaler is not None,
         "ready_for_rag": True,  # Always ready (fallback available)
-        "endpoints": [
-            "/api/neo/advanced-analytics",
-            "/api/neo/predict",
-            "/api/neo/model-status",
-            "/api/rag/kb-status",
-            "/api/rag/index-neos",
-            "/api/rag/query",
-            "/api/rag/auto-index"
-        ]
+        "caching_enabled": redis_connected,
+        "endpoints": {
+            "analytics": [
+                "/api/neo/advanced-analytics",
+                "/api/neo/predict",
+                "/api/neo/model-status",
+                "/api/neo/model-metrics",
+                "/api/neo/feature-importance",
+                "/api/neo/evaluate-model"
+            ],
+            "rag": [
+                "/api/rag/kb-status",
+                "/api/rag/index-neos",
+                "/api/rag/query",
+                "/api/rag/auto-index",
+                "/api/rag/clear-kb",
+                "/api/rag/reinit"
+            ],
+            "cache": [
+                "/api/cache/stats",
+                "/api/cache/health",
+                "/api/cache/keys",
+                "/api/cache/clear",
+                "/api/cache/warm"
+            ],
+            "monitoring": [
+                "/api/nasa/status"
+            ]
+        }
     }
 
 @app.get("/api/neo/advanced-analytics", response_model=AdvancedAnalyticsResponse)
 async def get_advanced_analytics(days: int = 30):
-    """Get advanced NEO analytics"""
+    """Get advanced NEO analytics with Redis caching"""
     all_records = []
     end_date = datetime.now()
     current_start = end_date - timedelta(days=days)
     
     num_chunks = (days // 7) + (1 if days % 7 != 0 else 0)
     
+    # Collect all chunk tasks for parallel execution
+    chunk_tasks = []
+    chunk_params = []
+    
+    temp_start = current_start
     for chunk in range(num_chunks):
-        chunk_end = min(current_start + timedelta(days=6), end_date)
-        start_str = current_start.strftime('%Y-%m-%d')
+        chunk_end = min(temp_start + timedelta(days=6), end_date)
+        start_str = temp_start.strftime('%Y-%m-%d')
         end_str = chunk_end.strftime('%Y-%m-%d')
-        
+        chunk_params.append((start_str, end_str))
+        temp_start = chunk_end + timedelta(days=1)
+        if temp_start > end_date:
+            break
+    
+    # Fetch all chunks (cached via Redis)
+    for start_str, end_str in chunk_params:
         try:
-            raw_data = fetch_nasa_data(start_str, end_str)
+            # Use cached async fetch - this will hit Redis cache if available
+            raw_data = await fetch_nasa_data_cached(start_str, end_str)
             chunk_data = parse_neo_data(raw_data)
             all_records.extend(chunk_data)
         except Exception as e:
-            print(f"Chunk error: {str(e)}")
+            print(f"Chunk error ({start_str} to {end_str}): {str(e)}")
             continue
-        
-        current_start = chunk_end + timedelta(days=1)
-        if current_start > end_date:
-            break
     
     if not all_records:
         raise HTTPException(status_code=404, detail="No data available")
@@ -728,57 +789,189 @@ async def get_model_status():
         "last_load_error": model_load_error
     }
 
+async def evaluate_model_on_live_data(days: int = 30) -> dict:
+    """
+    Evaluate the ML model against real NASA API data.
+    
+    Fetches NEO data, extracts features and ground truth labels,
+    runs predictions, and computes classification metrics.
+    
+    Returns:
+        Dictionary containing accuracy, precision, recall, F1, confusion matrix
+    """
+    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score
+    
+    if xgb_model is None or scaler is None:
+        raise ValueError("ML models not loaded")
+    
+    # Collect NEO data from NASA API
+    all_records = []
+    end_date = datetime.now()
+    current_start = end_date - timedelta(days=days)
+    
+    num_chunks = (days // 7) + (1 if days % 7 != 0 else 0)
+    
+    for chunk in range(num_chunks):
+        chunk_end = min(current_start + timedelta(days=6), end_date)
+        start_str = current_start.strftime('%Y-%m-%d')
+        end_str = chunk_end.strftime('%Y-%m-%d')
+        
+        try:
+            raw_data = await fetch_nasa_data_cached(start_str, end_str)
+            chunk_data = parse_neo_data(raw_data)
+            all_records.extend(chunk_data)
+        except Exception as e:
+            print(f"Evaluation chunk error: {str(e)}")
+            continue
+        
+        current_start = chunk_end + timedelta(days=1)
+        if current_start > end_date:
+            break
+    
+    if len(all_records) < 10:
+        raise ValueError(f"Insufficient data for evaluation: only {len(all_records)} records")
+    
+    # Remove duplicates
+    seen = set()
+    unique_records = []
+    for record in all_records:
+        key = (record.neo_id, record.miss_distance)
+        if key not in seen:
+            seen.add(key)
+            unique_records.append(record)
+    
+    # Extract features and labels
+    features_list = []
+    labels = []
+    
+    for neo in unique_records:
+        # Skip records with missing data
+        if neo.absolute_magnitude is None:
+            continue
+            
+        features_list.append([
+            neo.absolute_magnitude,
+            neo.estimated_diameter_min,
+            neo.estimated_diameter_max,
+            neo.relative_velocity,
+            neo.miss_distance
+        ])
+        labels.append(1 if neo.is_hazardous else 0)
+    
+    if len(features_list) < 10:
+        raise ValueError(f"Insufficient valid records: only {len(features_list)} with complete data")
+    
+    # Convert to numpy arrays
+    X = np.array(features_list)
+    y_true = np.array(labels)
+    
+    # Scale features and predict
+    X_scaled = scaler.transform(X)
+    y_pred = xgb_model.predict(X_scaled)
+    y_proba = xgb_model.predict_proba(X_scaled)[:, 1]
+    
+    # Compute metrics
+    accuracy = float(accuracy_score(y_true, y_pred))
+    
+    # Handle edge case where there might be only one class in the data
+    unique_labels = np.unique(y_true)
+    if len(unique_labels) < 2:
+        precision = 1.0 if y_true[0] == y_pred[0] else 0.0
+        recall = 1.0 if y_true[0] == y_pred[0] else 0.0
+        f1 = 1.0 if y_true[0] == y_pred[0] else 0.0
+        roc_auc = None
+    else:
+        precision = float(precision_score(y_true, y_pred, zero_division=0))
+        recall = float(recall_score(y_true, y_pred, zero_division=0))
+        f1 = float(f1_score(y_true, y_pred, zero_division=0))
+        try:
+            roc_auc = float(roc_auc_score(y_true, y_proba))
+        except:
+            roc_auc = None
+    
+    # Confusion matrix
+    cm = confusion_matrix(y_true, y_pred)
+    tn, fp, fn, tp = 0, 0, 0, 0
+    if cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+    elif cm.shape == (1, 1):
+        if y_true[0] == 0:
+            tn = int(cm[0, 0])
+        else:
+            tp = int(cm[0, 0])
+    
+    # Count class distribution
+    hazardous_count = int(np.sum(y_true == 1))
+    non_hazardous_count = int(np.sum(y_true == 0))
+    
+    return {
+        "accuracy": round(accuracy, 4),
+        "precision": round(precision, 4),
+        "recall": round(recall, 4),
+        "f1_score": round(f1, 4),
+        "roc_auc": round(roc_auc, 4) if roc_auc else None,
+        "evaluation_samples": len(y_true),
+        "hazardous_count": hazardous_count,
+        "non_hazardous_count": non_hazardous_count,
+        "confusion_matrix": {
+            "true_positives": int(tp),
+            "true_negatives": int(tn),
+            "false_positives": int(fp),
+            "false_negatives": int(fn)
+        },
+        "evaluation_date": datetime.now().isoformat(),
+        "data_range_days": days,
+        "data_source": "NASA NeoWs API (Live)",
+        "metrics_type": "dynamic_evaluation"
+    }
+
+
 @app.get("/api/neo/model-metrics")
-async def get_model_metrics():
-    """Get ML model performance metrics dynamically"""
+async def get_model_metrics(force_evaluation: bool = False):
+    """
+    Get ML model performance metrics - computed dynamically from live NASA data.
+    
+    Metrics are cached in Redis for 1 hour to avoid repeated expensive evaluations.
+    Use force_evaluation=true to trigger a fresh evaluation.
+    """
     if xgb_model is None:
         raise HTTPException(status_code=503, detail="ML model not loaded")
     
     try:
-        # Get model parameters and compute metrics dynamically
-        model_params = {}
-        training_samples = 0
+        # Try to get cached metrics from Redis first
+        redis_client = await get_redis_client()
+        cached_metrics = None
         
-        # Extract info from XGBoost model
+        if redis_client and not force_evaluation:
+            try:
+                cached_data = await redis_client.get("model_metrics:evaluation")
+                if cached_data:
+                    cached_metrics = json.loads(cached_data)
+                    print("✓ Using cached model metrics from Redis")
+            except Exception as e:
+                print(f"Redis cache read error: {e}")
+        
+        # Get model parameters
+        model_params = {}
+        n_estimators = 100
+        
         try:
-            # Get number of boosting rounds (trees)
             n_estimators = xgb_model.n_estimators if hasattr(xgb_model, 'n_estimators') else 100
-            
-            # Get model configuration
             if hasattr(xgb_model, 'get_params'):
                 model_params = xgb_model.get_params()
-            
-            # Try to get training info from booster
             if hasattr(xgb_model, 'get_booster'):
                 booster = xgb_model.get_booster()
-                # Get number of trees
                 n_estimators = booster.num_boosted_rounds() if hasattr(booster, 'num_boosted_rounds') else n_estimators
         except Exception as e:
             print(f"Error getting model params: {e}")
         
-        # Calculate metrics based on model's internal validation scores if available
-        # These are computed from cross-validation during training
-        # For a production system, these would be stored with the model
-        
-        # Get feature importances to determine model quality indicators
+        # Get feature importances
         importances = xgb_model.feature_importances_
         max_importance = float(max(importances))
         importance_variance = float(np.var(importances))
-        
-        # Estimate metrics based on model characteristics
-        # In production, these should be saved during training and loaded here
-        # For now, we compute approximations based on model properties
-        
-        # Check if model has best_score from training
-        best_score = None
-        if hasattr(xgb_model, 'best_score'):
-            best_score = xgb_model.best_score
-        
-        # Get objective function to understand what was optimized
         objective = model_params.get('objective', 'binary:logistic')
         
-        # Return dynamic metrics
-        # Note: In a production system, save these during training
+        # Base metrics structure
         metrics = {
             "model_type": "XGBoost Classifier",
             "n_estimators": n_estimators,
@@ -789,37 +982,42 @@ async def get_model_metrics():
             "max_feature_importance": max_importance,
             "importance_variance": importance_variance,
             "model_loaded": True,
-            "scaler_loaded": scaler is not None,
-            # Performance metrics - these should be computed during training
-            # and stored with the model. For demonstration, we use the model's
-            # internal cross-validation if available
-            "performance": {
-                "note": "Metrics computed from model cross-validation during training",
-                "data_source": "NASA NeoWs Historical Database"
-            }
+            "scaler_loaded": scaler is not None
         }
         
-        # Try to load saved metrics if they exist
-        metrics_paths = ['model_metrics.json', './model_metrics.json', 
-                        '../model_metrics.json', './models/model_metrics.json']
+        # Use cached metrics if available
+        if cached_metrics:
+            metrics["performance"] = cached_metrics
+            metrics["metrics_source"] = "redis_cache"
+            metrics["cache_hit"] = True
+            return metrics
         
-        for path in metrics_paths:
-            if os.path.exists(path):
+        # Compute metrics dynamically from live NASA data
+        try:
+            print("🔄 Computing model metrics from live NASA data...")
+            evaluation_results = await evaluate_model_on_live_data(days=30)
+            
+            # Cache the results in Redis for 1 hour
+            if redis_client:
                 try:
-                    with open(path, 'r') as f:
-                        saved_metrics = json.load(f)
-                        metrics["performance"] = saved_metrics
-                        metrics["metrics_source"] = "saved_file"
-                        break
+                    await redis_client.setex(
+                        "model_metrics:evaluation",
+                        3600,  # 1 hour TTL
+                        json.dumps(evaluation_results)
+                    )
+                    print("💾 Model metrics cached in Redis (1h TTL)")
                 except Exception as e:
-                    print(f"Error loading metrics from {path}: {e}")
-        
-        # If no saved metrics, compute from model if possible
-        if "accuracy" not in metrics.get("performance", {}):
-            # These values should ideally come from saved training metrics
-            # Computing actual metrics requires the test dataset
+                    print(f"Redis cache write error: {e}")
+            
+            metrics["performance"] = evaluation_results
+            metrics["metrics_source"] = "live_evaluation"
+            metrics["cache_hit"] = False
+            
+        except Exception as eval_error:
+            print(f"Live evaluation failed: {eval_error}")
+            # Fallback: return model properties without performance metrics
             metrics["performance"] = {
-                "note": "For accurate metrics, run model evaluation with test data",
+                "note": f"Live evaluation temporarily unavailable: {str(eval_error)}",
                 "model_ready": True,
                 "features_trained": 5,
                 "feature_names": [
@@ -830,12 +1028,61 @@ async def get_model_metrics():
                     "Miss Distance"
                 ]
             }
-            metrics["metrics_source"] = "model_properties"
+            metrics["metrics_source"] = "fallback"
+            metrics["evaluation_error"] = str(eval_error)
         
         return metrics
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get model metrics: {str(e)}")
+
+
+@app.post("/api/neo/evaluate-model")
+async def trigger_model_evaluation(days: int = 30):
+    """
+    Trigger a fresh model evaluation against live NASA data.
+    
+    This endpoint forces a new evaluation regardless of cached results.
+    Results are cached in Redis for subsequent requests.
+    
+    Args:
+        days: Number of days of NASA data to use for evaluation (default: 30)
+    """
+    if xgb_model is None or scaler is None:
+        raise HTTPException(status_code=503, detail="ML models not available")
+    
+    try:
+        print(f"🚀 Starting model evaluation with {days} days of data...")
+        
+        evaluation_results = await evaluate_model_on_live_data(days=min(days, 60))
+        
+        # Cache the results in Redis
+        redis_client = await get_redis_client()
+        if redis_client:
+            try:
+                await redis_client.setex(
+                    "model_metrics:evaluation",
+                    3600,  # 1 hour TTL
+                    json.dumps(evaluation_results)
+                )
+                evaluation_results["cached"] = True
+                evaluation_results["cache_ttl_seconds"] = 3600
+            except Exception as e:
+                print(f"Redis cache error: {e}")
+                evaluation_results["cached"] = False
+        else:
+            evaluation_results["cached"] = False
+        
+        return {
+            "status": "success",
+            "message": f"Model evaluated on {evaluation_results['evaluation_samples']} samples",
+            "evaluation": evaluation_results
+        }
+    
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Evaluation failed: {str(e)}")
 
 @app.get("/api/neo/feature-importance")
 async def get_feature_importance():
@@ -922,7 +1169,7 @@ async def get_kb_status():
 
 @app.post("/api/rag/auto-index")
 async def auto_index_from_nasa():
-    """Auto-index NEO data from NASA"""
+    """Auto-index NEO data from NASA with Redis caching"""
     global neo_documents
     
     try:
@@ -938,7 +1185,8 @@ async def auto_index_from_nasa():
             end_str = chunk_end.strftime('%Y-%m-%d')
             
             try:
-                raw_data = fetch_nasa_data(start_str, end_str)
+                # Use cached async fetch - leverages Redis caching
+                raw_data = await fetch_nasa_data_cached(start_str, end_str)
                 chunk_data = parse_neo_data(raw_data)
                 all_records.extend(chunk_data)
             except Exception as e:
@@ -1381,23 +1629,211 @@ async def reinitialize_weaviate():
             "error": str(e)
         }
 
+
+# =============================================================================
+# CACHE MANAGEMENT ENDPOINTS (Redis Look-Aside Caching)
+# =============================================================================
+
+@app.get("/api/cache/stats")
+async def get_cache_statistics():
+    """
+    Get Redis cache statistics for observability.
+    
+    Returns hit/miss ratios, connection status, and memory usage.
+    Useful for monitoring cache effectiveness and debugging.
+    """
+    try:
+        stats = await get_cache_stats()
+        return {
+            "status": "success",
+            "cache": stats,
+            "cache_enabled": stats.get("redis_connected", False),
+            "recommendation": (
+                "Cache is performing well" 
+                if stats.get("hit_ratio_percent", 0) > 50 
+                else "Consider warming the cache with common queries"
+            )
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "cache_enabled": False
+        }
+
+
+@app.delete("/api/cache/clear")
+async def clear_redis_cache(pattern: str = "nasa:*"):
+    """
+    Clear cached entries matching a pattern.
+    
+    Args:
+        pattern: Redis key pattern (default: all NASA cache keys)
+    
+    Use cases:
+    - Clear all: pattern="nasa:*"
+    - Clear feed cache only: pattern="neo_feed:*"
+    - Clear lookup cache only: pattern="neo_lookup:*"
+    """
+    try:
+        result = await clear_cache(pattern)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cache clear failed: {str(e)}")
+
+
+@app.get("/api/cache/keys")
+async def get_cached_keys(pattern: str = "nasa:*"):
+    """
+    Get information about cached keys for debugging.
+    
+    Returns key names and their remaining TTL.
+    Limited to first 50 keys for performance.
+    """
+    try:
+        keys = await get_cached_keys_info(pattern)
+        return {
+            "status": "success",
+            "pattern": pattern,
+            "key_count": len(keys),
+            "keys": keys
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get keys: {str(e)}")
+
+
+@app.get("/api/cache/health")
+async def check_cache_health():
+    """
+    Health check for Redis cache.
+    
+    Returns connection status and latency.
+    """
+    import time
+    
+    start = time.time()
+    client = await get_redis_client()
+    
+    if client is None:
+        return {
+            "status": "degraded",
+            "redis_connected": False,
+            "message": "Redis unavailable - operating in pass-through mode",
+            "impact": "All requests go directly to NASA API (rate limit risk)"
+        }
+    
+    try:
+        await client.ping()
+        latency_ms = (time.time() - start) * 1000
+        
+        return {
+            "status": "healthy",
+            "redis_connected": True,
+            "latency_ms": round(latency_ms, 2),
+            "message": "Redis cache is operational"
+        }
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "redis_connected": False,
+            "error": str(e),
+            "message": "Redis connection failed"
+        }
+
+
+@app.post("/api/cache/warm")
+async def warm_cache(days: int = 7):
+    """
+    Pre-warm the cache with recent NASA data.
+    
+    Fetches the last N days of data to populate the cache,
+    reducing latency for subsequent requests.
+    
+    Args:
+        days: Number of days to cache (default: 7, max: 30)
+    """
+    days = min(days, 30)  # Cap at 30 days
+    
+    try:
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days)
+        
+        warmed_chunks = 0
+        failed_chunks = 0
+        
+        current_start = start_date
+        while current_start < end_date:
+            chunk_end = min(current_start + timedelta(days=6), end_date)
+            start_str = current_start.strftime('%Y-%m-%d')
+            end_str = chunk_end.strftime('%Y-%m-%d')
+            
+            try:
+                # This will cache the data via the decorator
+                await fetch_nasa_data_cached(start_str, end_str)
+                warmed_chunks += 1
+            except Exception as e:
+                print(f"Warm cache error: {str(e)}")
+                failed_chunks += 1
+            
+            current_start = chunk_end + timedelta(days=1)
+        
+        return {
+            "status": "success",
+            "message": f"Cache warmed for {days} days of data",
+            "chunks_warmed": warmed_chunks,
+            "chunks_failed": failed_chunks,
+            "date_range": f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cache warming failed: {str(e)}")
+
+
+@app.get("/api/nasa/status")
+async def check_nasa_api_status():
+    """
+    Check NASA API availability and rate limit status.
+    
+    Makes a minimal request to verify the API is reachable.
+    Useful for monitoring and debugging.
+    """
+    try:
+        status = await NasaService.get_api_status()
+        return status
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e)
+        }
+
 if __name__ == "__main__":
     print("\n" + "="*70)
-    print("NASA NEO ADVANCED ANALYTICS API v4.0.1")
+    print("NASA NEO ADVANCED ANALYTICS API v4.1.0")
     print("="*70)
     
     print("\nAvailable endpoints:")
-    print("  - GET  /")
-    print("  - GET  /api/neo/advanced-analytics?days=30")
-    print("  - POST /api/neo/predict")
-    print("  - GET  /api/neo/model-status")
-    print("  - POST /api/neo/reload-models")
-    print("  - GET  /api/rag/kb-status")
-    print("  - POST /api/rag/auto-index")
-    print("  - POST /api/rag/index-neos")
-    print("  - POST /api/rag/query")
-    print("  - DELETE /api/rag/clear-kb")
-    print("  - POST /api/rag/reinit")
+    print("  Analytics:")
+    print("    - GET  /api/neo/advanced-analytics?days=30")
+    print("    - POST /api/neo/predict")
+    print("    - GET  /api/neo/model-status")
+    print("    - GET  /api/neo/model-metrics (dynamic - evaluates on live data)")
+    print("    - GET  /api/neo/feature-importance")
+    print("    - POST /api/neo/evaluate-model?days=30 (force fresh evaluation)")
+    print("  RAG:")
+    print("    - GET  /api/rag/kb-status")
+    print("    - POST /api/rag/auto-index")
+    print("    - POST /api/rag/index-neos")
+    print("    - POST /api/rag/query")
+    print("    - DELETE /api/rag/clear-kb")
+    print("    - POST /api/rag/reinit")
+    print("  Cache (Redis Look-Aside):")
+    print("    - GET  /api/cache/stats")
+    print("    - GET  /api/cache/health")
+    print("    - GET  /api/cache/keys")
+    print("    - DELETE /api/cache/clear")
+    print("    - POST /api/cache/warm")
+    print("  Monitoring:")
+    print("    - GET  /api/nasa/status")
     
     print(f"\nML Models:")
     print(f"  XGBoost: {'✓ Loaded' if xgb_model else '✗ Not Found'}")
@@ -1408,6 +1844,12 @@ if __name__ == "__main__":
     print(f"  Storage:  {'Weaviate' if weaviate_client else 'In-Memory'}")
     print(f"  Semantic: {'✓ Enabled' if embedding_model else '✗ Fallback'}")
     print(f"  OpenRouter: ✓ Configured")
+    
+    print(f"\nRedis Cache (Look-Aside):")
+    print(f"  URL: {os.getenv('REDIS_URL', 'redis://localhost:6379/0')}")
+    print(f"  Feed TTL: 24 hours (86400s)")
+    print(f"  Lookup TTL: 7 days (604800s)")
+    print(f"  Note: Cache status available at /api/cache/health")
     
     if weaviate_client:
         try:
