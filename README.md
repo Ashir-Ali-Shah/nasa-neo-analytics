@@ -44,11 +44,51 @@ Which physical properties make an asteroid dangerous? The model found **Absolute
 
 ---
 
+## 🤖 Agentic RAG System (NEW!)
+
+This project features an **autonomous AI agent** that goes beyond simple Q&A. Unlike basic RAG systems, this agent can:
+
+### How It Works
+1. **Reason** about what information it needs
+2. **Decide** which tools to use
+3. **Execute** tools and observe results
+4. **Synthesize** a comprehensive response
+
+### Available Tools
+| Tool | Description |
+| :--- | :--- |
+| `search_knowledge_base` | Search vector database for historical NEO data |
+| `fetch_live_nasa_feed` | Fetch real-time data from NASA NeoWs API |
+| `calculate_risk` | Physics-based risk assessment calculator |
+
+### Example Queries
+- *"What is the most dangerous asteroid approaching this week?"*
+- *"Calculate the risk for an asteroid 100m wide at 20 km/s missing by 100,000 km"*
+- *"Compare today's closest approach to historical data"*
+
+### API Endpoints
+```bash
+# Main agent endpoint
+POST /api/agent/query
+{
+  "question": "Is there anything dangerous coming this weekend?",
+  "include_reasoning": true
+}
+
+# Agent status
+GET /api/agent/status
+
+# Quick NEO analysis
+POST /api/agent/analyze-neo?diameter_km=0.1&velocity_kms=20&miss_distance_km=100000
+```
+
+---
+
 ## 🛠️ Tech Stack
 * **Frontend:** React, Recharts (Data Visualization), Tailwind CSS
-* **Backend:** FastAPI, Python, Weaviate (Vector DB)
+* **Backend:** FastAPI, Python, Weaviate (Vector DB), Redis (Caching)
 * **Machine Learning:** XGBoost, Scikit-Learn, Pandas
-* **AI:** RAG System (Retrieval-Augmented Generation) with OpenRouter/LLM integration
+* **AI:** Agentic RAG with OpenAI-compatible Tool Calling (via OpenRouter)
 * **DevOps:** Docker, Docker Compose
 
 ## ⚙️ How to Run

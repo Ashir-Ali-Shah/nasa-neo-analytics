@@ -30,6 +30,14 @@ from core.cache import (
     get_redis_client
 )
 from services.nasa_service import NasaService
+from services.agent_service import AgentService, create_agent
+from core.calculations import (
+    calculate_kinetic_energy as calc_ke,
+    calculate_impact_probability as calc_ip,
+    calculate_risk_score as calc_rs,
+    get_risk_category,
+    full_risk_assessment
+)
 
 # Try to import Weaviate, but don't fail if not available
 try:
@@ -516,7 +524,7 @@ async def root():
     return {
         "status": "online",
         "service": "NASA NEO Advanced Analytics API",
-        "version": "4.1.0",  # Version bump for caching feature
+        "version": "5.0.0",  # Version bump for Agentic RAG feature
         "ml_models_loaded": {
             "xgboost": xgb_model is not None,
             "scaler": scaler is not None
@@ -527,7 +535,13 @@ async def root():
         "knowledge_base_documents": kb_count,
         "ready_for_predictions": xgb_model is not None and scaler is not None,
         "ready_for_rag": True,  # Always ready (fallback available)
+        "ready_for_agent": True,  # Agentic RAG system
         "caching_enabled": redis_connected,
+        "agent_system": {
+            "status": "operational",
+            "type": "Agentic RAG with OpenAI Tool Calling",
+            "tools": ["search_knowledge_base", "fetch_live_nasa_feed", "calculate_risk"]
+        },
         "endpoints": {
             "analytics": [
                 "/api/neo/advanced-analytics",
@@ -536,6 +550,11 @@ async def root():
                 "/api/neo/model-metrics",
                 "/api/neo/feature-importance",
                 "/api/neo/evaluate-model"
+            ],
+            "agent": [
+                "/api/agent/query",
+                "/api/agent/status",
+                "/api/agent/analyze-neo"
             ],
             "rag": [
                 "/api/rag/kb-status",
@@ -1631,6 +1650,260 @@ async def reinitialize_weaviate():
 
 
 # =============================================================================
+# AGENTIC RAG SYSTEM - Autonomous AI with Tool Calling
+# =============================================================================
+
+# Pydantic models for Agent endpoints
+class AgentQueryRequest(BaseModel):
+    """Request model for agent queries."""
+    question: str
+    include_reasoning: Optional[bool] = False
+
+class AgentQueryResponse(BaseModel):
+    """Response model for agent queries."""
+    answer: str
+    tools_used: List[str]
+    sources: List[Dict]
+    iterations: int
+    reasoning_steps: Optional[List[Dict]] = None
+
+
+async def search_knowledge_base_for_agent(query: str) -> List[Dict]:
+    """
+    Knowledge base search function to inject into the Agent.
+    
+    This function wraps the existing Weaviate/fallback search logic
+    and returns documents in a format the agent can use.
+    """
+    global weaviate_client, embedding_model, neo_documents
+    
+    sources = []
+    
+    # Try Weaviate search first
+    if weaviate_client:
+        try:
+            collection = weaviate_client.collections.get("NEODocument")
+            query_embedding = get_semantic_embedding(query)
+            
+            results = collection.query.hybrid(
+                query=query,
+                vector=query_embedding,
+                limit=5,
+                alpha=0.7,
+                return_metadata=MetadataQuery(score=True)
+            )
+            
+            for obj in results.objects:
+                sources.append({
+                    "neo_id": obj.properties.get("neo_id"),
+                    "name": obj.properties.get("name"),
+                    "date": obj.properties.get("date"),
+                    "risk_score": obj.properties.get("risk_score"),
+                    "risk_category": obj.properties.get("risk_category"),
+                    "diameter_km": obj.properties.get("diameter_km"),
+                    "velocity_kms": obj.properties.get("velocity_kms"),
+                    "miss_distance_km": obj.properties.get("miss_distance_km"),
+                    "content": obj.properties.get("content", "")
+                })
+            
+            return sources
+        
+        except Exception as e:
+            print(f"Weaviate search error in agent: {str(e)}")
+    
+    # Fallback to in-memory search
+    if neo_documents:
+        query_lower = query.lower()
+        scored_docs = []
+        
+        for doc in neo_documents:
+            content_lower = doc.get("content", "").lower()
+            score = sum(1 for word in query_lower.split() if word in content_lower)
+            
+            if score > 0:
+                scored_docs.append((doc, score))
+        
+        scored_docs.sort(key=lambda x: x[1], reverse=True)
+        
+        for doc, score in scored_docs[:5]:
+            sources.append(doc)
+    
+    return sources
+
+
+# Create global agent instance
+neo_agent: Optional[AgentService] = None
+
+def get_agent() -> AgentService:
+    """Get or create the agent instance."""
+    global neo_agent
+    if neo_agent is None:
+        neo_agent = create_agent(
+            knowledge_base_search_fn=search_knowledge_base_for_agent
+        )
+    return neo_agent
+
+
+@app.post("/api/agent/query", response_model=AgentQueryResponse)
+async def query_agent(request: AgentQueryRequest):
+    """
+    Query the Agentic RAG system.
+    
+    This is the main endpoint for the autonomous AI agent. Unlike the basic
+    RAG endpoint, this agent can:
+    
+    1. **Reason** about what information it needs
+    2. **Decide** which tools to use (search KB, fetch live data, calculate risk)
+    3. **Execute** tools and observe results
+    4. **Synthesize** a comprehensive response
+    
+    The agent uses OpenAI-compatible function calling to interact with:
+    - Knowledge Base (historical asteroid data)
+    - NASA Live Feed (real-time close approach data)
+    - Risk Calculator (physics-based threat assessment)
+    
+    Args:
+        question: Natural language question about NEOs
+        include_reasoning: If true, includes step-by-step reasoning in response
+    
+    Returns:
+        AgentQueryResponse with answer, tools used, sources, and optionally reasoning
+    
+    Example questions:
+    - "What is the most dangerous asteroid approaching this week?"
+    - "Calculate the risk for an asteroid 100m wide at 20 km/s missing by 100,000 km"
+    - "Compare today's closest approach to historical data"
+    """
+    try:
+        agent = get_agent()
+        result = await agent.process_query(request.question)
+        
+        response = AgentQueryResponse(
+            answer=result.get("answer", "I couldn't process your query."),
+            tools_used=result.get("tools_used", []),
+            sources=result.get("sources", []),
+            iterations=result.get("iterations", 0)
+        )
+        
+        if request.include_reasoning:
+            response.reasoning_steps = result.get("reasoning_steps", [])
+        
+        return response
+    
+    except Exception as e:
+        print(f"Agent query error: {str(e)}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
+
+
+@app.get("/api/agent/status")
+async def get_agent_status():
+    """
+    Get the status of the Agentic RAG system.
+    
+    Returns information about:
+    - Agent availability
+    - Available tools
+    - Knowledge base status
+    - LLM configuration
+    """
+    kb_count = 0
+    if weaviate_client:
+        try:
+            collection = weaviate_client.collections.get("NEODocument")
+            response = collection.aggregate.over_all(total_count=True)
+            kb_count = response.total_count
+        except:
+            kb_count = len(neo_documents)
+    else:
+        kb_count = len(neo_documents)
+    
+    return {
+        "status": "operational",
+        "agent_type": "Agentic RAG with Tool Calling",
+        "llm_model": CHAT_MODEL,
+        "llm_provider": "OpenRouter",
+        "available_tools": [
+            {
+                "name": "search_knowledge_base",
+                "description": "Search vector database for historical NEO data",
+                "status": "available" if (weaviate_client or neo_documents) else "empty"
+            },
+            {
+                "name": "fetch_live_nasa_feed", 
+                "description": "Fetch real-time data from NASA NeoWs API",
+                "status": "available"
+            },
+            {
+                "name": "calculate_risk",
+                "description": "Physics-based risk assessment calculator",
+                "status": "available"
+            }
+        ],
+        "knowledge_base": {
+            "backend": "weaviate" if weaviate_client else "in-memory",
+            "document_count": kb_count,
+            "semantic_search": embedding_model is not None
+        },
+        "max_iterations": 5,
+        "capabilities": [
+            "Multi-tool reasoning",
+            "Real-time data access",
+            "Historical data retrieval",
+            "Physics calculations",
+            "Risk assessment"
+        ]
+    }
+
+
+@app.post("/api/agent/analyze-neo")
+async def agent_analyze_neo(
+    neo_name: Optional[str] = None,
+    diameter_km: Optional[float] = None,
+    velocity_kms: Optional[float] = None,
+    miss_distance_km: Optional[float] = None
+):
+    """
+    Quick analysis of a specific NEO using the agent.
+    
+    Provide either a NEO name (agent will search for it) or 
+    physical parameters (agent will calculate risk).
+    
+    Args:
+        neo_name: Name of the asteroid to analyze (searches KB and live data)
+        diameter_km: Diameter in kilometers (for direct calculation)
+        velocity_kms: Velocity in km/s (for direct calculation)
+        miss_distance_km: Miss distance in km (for direct calculation)
+    
+    Returns:
+        Agent analysis of the NEO
+    """
+    if neo_name:
+        query = f"Analyze the asteroid {neo_name}. Find its data and calculate its risk level."
+    elif diameter_km and velocity_kms and miss_distance_km:
+        query = f"""Calculate the risk assessment for an asteroid with:
+- Diameter: {diameter_km} km
+- Velocity: {velocity_kms} km/s
+- Miss distance: {miss_distance_km} km
+
+Provide a complete threat analysis."""
+    else:
+        raise HTTPException(
+            status_code=400, 
+            detail="Provide either neo_name OR all three parameters (diameter_km, velocity_kms, miss_distance_km)"
+        )
+    
+    agent = get_agent()
+    result = await agent.process_query(query)
+    
+    return {
+        "analysis": result.get("answer"),
+        "tools_used": result.get("tools_used", []),
+        "sources": result.get("sources", [])
+    }
+
+
+# =============================================================================
 # CACHE MANAGEMENT ENDPOINTS (Redis Look-Aside Caching)
 # =============================================================================
 
@@ -1808,7 +2081,8 @@ async def check_nasa_api_status():
 
 if __name__ == "__main__":
     print("\n" + "="*70)
-    print("NASA NEO ADVANCED ANALYTICS API v4.1.0")
+    print("NASA NEO ADVANCED ANALYTICS API v5.0.0")
+    print("With Agentic RAG - Autonomous AI with Tool Calling")
     print("="*70)
     
     print("\nAvailable endpoints:")
@@ -1819,7 +2093,11 @@ if __name__ == "__main__":
     print("    - GET  /api/neo/model-metrics (dynamic - evaluates on live data)")
     print("    - GET  /api/neo/feature-importance")
     print("    - POST /api/neo/evaluate-model?days=30 (force fresh evaluation)")
-    print("  RAG:")
+    print("  Agentic RAG (NEW!):")
+    print("    - POST /api/agent/query (main agent endpoint)")
+    print("    - GET  /api/agent/status")
+    print("    - POST /api/agent/analyze-neo")
+    print("  RAG (Basic):")
     print("    - GET  /api/rag/kb-status")
     print("    - POST /api/rag/auto-index")
     print("    - POST /api/rag/index-neos")
@@ -1839,11 +2117,15 @@ if __name__ == "__main__":
     print(f"  XGBoost: {'✓ Loaded' if xgb_model else '✗ Not Found'}")
     print(f"  Scaler:  {'✓ Loaded' if scaler else '✗ Not Found'}")
     
+    print(f"\nAgentic RAG System:")
+    print(f"  Status: ✓ Operational")
+    print(f"  Tools:  search_knowledge_base, fetch_live_nasa_feed, calculate_risk")
+    print(f"  LLM:    {CHAT_MODEL} (via OpenRouter)")
+    
     print(f"\nRAG System:")
     print(f"  Weaviate: {'✓ Connected' if weaviate_client else '✗ Using Fallback'}")
     print(f"  Storage:  {'Weaviate' if weaviate_client else 'In-Memory'}")
     print(f"  Semantic: {'✓ Enabled' if embedding_model else '✗ Fallback'}")
-    print(f"  OpenRouter: ✓ Configured")
     
     print(f"\nRedis Cache (Look-Aside):")
     print(f"  URL: {os.getenv('REDIS_URL', 'redis://localhost:6379/0')}")
@@ -1857,11 +2139,11 @@ if __name__ == "__main__":
             response = collection.aggregate.over_all(total_count=True)
             count = response.total_count
             print(f"\n{'✓'*35}")
-            print(f"✓ RAG System Ready! Documents: {count}")
+            print(f"✓ Agentic RAG System Ready! Documents: {count}")
             print(f"{'✓'*35}")
         except:
             print(f"\n{'✓'*35}")
-            print(f"✓ RAG System Ready (empty)")
+            print(f"✓ Agentic RAG System Ready (empty KB)")
             print(f"{'✓'*35}")
     else:
         print(f"\n{'⚠'*35}")
