@@ -44,42 +44,66 @@ Which physical properties make an asteroid dangerous? The model found **Absolute
 
 ---
 
-## 🤖 Agentic RAG System (NEW!)
+## 🤖 Robot Scientist - LangGraph Agentic RAG
 
-This project features an **autonomous AI agent** that goes beyond simple Q&A. Unlike basic RAG systems, this agent can:
+> **Premium Skill: Agentic Engineering** — This project showcases LangGraph, one of the most in-demand AI frameworks in 2026 alongside LlamaIndex and CrewAI.
 
-### How It Works
-1. **Reason** about what information it needs
-2. **Decide** which tools to use
-3. **Execute** tools and observe results
-4. **Synthesize** a comprehensive response
+This project features the **"Robot Scientist,"** an autonomous planetary defense agent built with **LangGraph** (from the LangChain ecosystem) using the **ReAct (Reasoning + Acting)** protocol.
+
+### Architecture (LangGraph StateGraph)
+```
+    ┌─────────┐
+    │  START  │
+    └────┬────┘
+         │
+         ▼
+    ┌─────────┐
+    │  agent  │◄──────┐
+    └────┬────┘       │
+         │            │
+   ┌─────┴─────┐      │
+   │           │      │
+   ▼           ▼      │
+┌─────┐    ┌───────┐  │
+│ END │    │ tools │──┘
+└─────┘    └───────┘
+```
+
+### How It Works (ReAct Protocol)
+1. **Thought**: What information is missing? Which tool is best?
+2. **Action**: Call the appropriate tool (NASA feed, ML model, or knowledge base)
+3. **Observation**: Analyze the tool output
+4. **Repeat** if needed, then deliver a **Mission Control Briefing**
 
 ### Available Tools
-| Tool | Description |
-| :--- | :--- |
-| `search_knowledge_base` | Search vector database for historical NEO data |
-| `fetch_live_nasa_feed` | Fetch real-time data from NASA NeoWs API |
-| `calculate_risk` | Physics-based risk assessment calculator |
+| Tool | Description | Priority |
+| :--- | :--- | :--- |
+| `fetch_live_nasa_feed` | Real-time asteroid data from NASA NeoWs API | Use first for current/future queries |
+| `predict_hazard_xgboost` | ML model trained on 127,347 asteroids (94.18% accuracy) | Use for hazard classification |
+| `search_knowledge_base` | Historical NEO data from Weaviate | Use for context and analogies |
+
+### Key Principle
+> **NO MANUAL CALCULATIONS**: The Robot Scientist is forbidden from performing complex physics math. It must use the `predict_hazard_xgboost` ML tool for all hazard assessments.
 
 ### Example Queries
 - *"What is the most dangerous asteroid approaching this week?"*
-- *"Calculate the risk for an asteroid 100m wide at 20 km/s missing by 100,000 km"*
-- *"Compare today's closest approach to historical data"*
+- *"Is asteroid 2024 XY hazardous? Use the ML model to predict."*
+- *"Compare today's closest approach to Chelyabinsk"*
 
 ### API Endpoints
 ```bash
-# Main agent endpoint
+# Main agent endpoint (LangGraph ReAct loop)
 POST /api/agent/query
 {
   "question": "Is there anything dangerous coming this weekend?",
   "include_reasoning": true
 }
 
-# Agent status
+# Agent status (shows LangGraph structure)
 GET /api/agent/status
 
-# Quick NEO analysis
-POST /api/agent/analyze-neo?diameter_km=0.1&velocity_kms=20&miss_distance_km=100000
+# Quick NEO analysis by name or parameters
+POST /api/agent/analyze-neo?neo_name=2024%20XY
 ```
 
 ---
@@ -87,9 +111,12 @@ POST /api/agent/analyze-neo?diameter_km=0.1&velocity_kms=20&miss_distance_km=100
 ## 🛠️ Tech Stack
 * **Frontend:** React, Recharts (Data Visualization), Tailwind CSS
 * **Backend:** FastAPI, Python, Weaviate (Vector DB), Redis (Caching)
-* **Machine Learning:** XGBoost, Scikit-Learn, Pandas
-* **AI:** Agentic RAG with OpenAI-compatible Tool Calling (via OpenRouter)
+* **Machine Learning:** XGBoost (94.18% accuracy on 127,347 samples)
+* **MLOps:** MLflow (Experiment Tracking & Model Registry)
+* **Agentic AI:** LangGraph >= 0.2.0, LangChain >= 0.3.0 (ReAct Protocol)
+* **LLM Provider:** OpenRouter (Qwen, Claude, GPT-4 compatible)
 * **DevOps:** Docker, Docker Compose
+* **Monitoring:** Prometheus, Grafana
 
 ## ⚙️ How to Run
 
@@ -117,6 +144,9 @@ docker compose up --build
 
   * **Dashboard:** [http://localhost:5173](https://www.google.com/search?q=http://localhost:5173)
   * **API Docs:** [http://localhost:8000/docs](https://www.google.com/search?q=http://localhost:8000/docs)
+  * **Prometheus:** [http://localhost:9090](http://localhost:9090)
+  * **Grafana:** [http://localhost:3000](http://localhost:3000) (Login: admin/admin)
+  * **MLflow:** [http://localhost:5001](http://localhost:5001) (Experiment Tracking UI)
 
 ## 📂 Project Structure
 
@@ -130,6 +160,7 @@ nasa-neo-analytics/
 │   ├── src/             # UI Components
 │   └── Dockerfile
 └── docker-compose.yml   # Orchestration
+├── monitoring/          # Prometheus & Grafana Configs
 ```
 
 -----

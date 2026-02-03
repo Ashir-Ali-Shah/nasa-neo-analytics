@@ -30,7 +30,7 @@ from core.cache import (
     get_redis_client
 )
 from services.nasa_service import NasaService
-from services.agent_service import AgentService, create_agent
+from services.agent_service import LangGraphAgentService, create_langgraph_agent
 from core.calculations import (
     calculate_kinetic_energy as calc_ke,
     calculate_impact_probability as calc_ip,
@@ -38,6 +38,14 @@ from core.calculations import (
     get_risk_category,
     full_risk_assessment
 )
+
+# Try to import MLflow service
+try:
+    from services.mlflow_service import MLflowService
+    MLFLOW_AVAILABLE = True
+except ImportError:
+    MLFLOW_AVAILABLE = False
+    print("WARNING: MLflow service not available.")
 
 # Try to import Weaviate, but don't fail if not available
 try:
@@ -63,6 +71,10 @@ app = FastAPI(
     description="Backend API with risk scoring, ML predictions, and RAG",
     version="4.0.1"
 )
+
+# Instrument with Prometheus
+from prometheus_fastapi_instrumentator import Instrumentator
+Instrumentator().instrument(app).expose(app)
 
 app.add_middleware(
     CORSMiddleware,
@@ -521,16 +533,25 @@ async def root():
     except:
         pass
     
+    # Check MLflow status
+    mlflow_connected = False
+    if MLFLOW_AVAILABLE:
+        try:
+            mlflow_connected = MLflowService.is_available()
+        except:
+            pass
+    
     return {
         "status": "online",
         "service": "NASA NEO Advanced Analytics API",
-        "version": "5.0.0",  # Version bump for Agentic RAG feature
+        "version": "5.1.0",  # Version bump for MLflow integration
         "ml_models_loaded": {
             "xgboost": xgb_model is not None,
             "scaler": scaler is not None
         },
         "weaviate_connected": weaviate_client is not None,
         "redis_cache_connected": redis_connected,
+        "mlflow_connected": mlflow_connected,
         "semantic_search_enabled": embedding_model is not None,
         "knowledge_base_documents": kb_count,
         "ready_for_predictions": xgb_model is not None and scaler is not None,
@@ -570,6 +591,17 @@ async def root():
                 "/api/cache/keys",
                 "/api/cache/clear",
                 "/api/cache/warm"
+            ],
+            "mlflow": [
+                "/api/mlflow/status",
+                "/api/mlflow/log-evaluation",
+                "/api/mlflow/full-evaluation",
+                "/api/mlflow/best-run",
+                "/api/mlflow/recent-runs",
+                "/api/mlflow/register-model",
+                "/api/mlflow/promote-model",
+                "/api/mlflow/compare-runs",
+                "/api/mlflow/registered-models"
             ],
             "monitoring": [
                 "/api/nasa/status"
@@ -778,6 +810,25 @@ async def predict_hazardous(input_data: PredictionInput):
         else:
             risk_level = "LOW"
             interpretation = f"Low probability ({hazardous_probability*100:.2f}%) of being hazardous."
+        
+        # Log prediction to MLflow for monitoring
+        if MLFLOW_AVAILABLE:
+            try:
+                MLflowService.log_prediction(
+                    input_features={
+                        'absolute_magnitude': input_data.absolute_magnitude,
+                        'estimated_diameter_min': input_data.estimated_diameter_min,
+                        'estimated_diameter_max': input_data.estimated_diameter_max,
+                        'relative_velocity': input_data.relative_velocity,
+                        'miss_distance': input_data.miss_distance
+                    },
+                    prediction=bool(prediction),
+                    probability=hazardous_probability,
+                    confidence=confidence,
+                    risk_level=risk_level
+                )
+            except Exception as mlflow_error:
+                print(f"MLflow logging error (non-critical): {mlflow_error}")
         
         return PredictionResponse(
             is_hazardous=bool(prediction),
@@ -1148,6 +1199,382 @@ async def get_feature_importance():
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get feature importance: {str(e)}")
+
+
+# ==================== MLflow Endpoints ====================
+
+@app.get("/api/mlflow/status")
+async def get_mlflow_status():
+    """
+    Get MLflow service status and experiment summary.
+    
+    Returns connection status, experiment info, and recent run statistics.
+    """
+    if not MLFLOW_AVAILABLE:
+        return {
+            "status": "unavailable",
+            "message": "MLflow service not installed",
+            "tracking_uri": None
+        }
+    
+    try:
+        return MLflowService.get_status()
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+
+@app.post("/api/mlflow/log-evaluation")
+async def log_evaluation_to_mlflow(days: int = 30, run_name: Optional[str] = None):
+    """
+    Evaluate the model and log results to MLflow.
+    
+    This endpoint:
+    1. Evaluates the model against live NASA data
+    2. Logs all metrics (accuracy, precision, recall, F1, ROC-AUC) to MLflow
+    3. Stores the confusion matrix and evaluation details as artifacts
+    
+    Args:
+        days: Number of days of NASA data to use (default: 30)
+        run_name: Optional custom name for this MLflow run
+    """
+    if not MLFLOW_AVAILABLE:
+        raise HTTPException(status_code=503, detail="MLflow service not available")
+    
+    if xgb_model is None or scaler is None:
+        raise HTTPException(status_code=503, detail="ML models not available")
+    
+    try:
+        # Run model evaluation
+        print(f"🚀 Evaluating model for MLflow logging ({days} days of data)...")
+        evaluation_results = await evaluate_model_on_live_data(days=min(days, 60))
+        
+        # Log to MLflow
+        run_id = MLflowService.log_model_evaluation(
+            metrics=evaluation_results,
+            model_name="xgb_neo_classifier",
+            run_name=run_name
+        )
+        
+        if run_id:
+            return {
+                "status": "success",
+                "message": "Evaluation logged to MLflow",
+                "run_id": run_id,
+                "metrics": {
+                    "accuracy": evaluation_results.get("accuracy"),
+                    "precision": evaluation_results.get("precision"),
+                    "recall": evaluation_results.get("recall"),
+                    "f1_score": evaluation_results.get("f1_score"),
+                    "roc_auc": evaluation_results.get("roc_auc"),
+                    "evaluation_samples": evaluation_results.get("evaluation_samples")
+                },
+                "mlflow_ui": "http://localhost:5000"
+            }
+        else:
+            return {
+                "status": "partial",
+                "message": "Evaluation completed but MLflow logging failed",
+                "evaluation": evaluation_results
+            }
+    
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Evaluation failed: {str(e)}")
+
+
+@app.get("/api/mlflow/best-run")
+async def get_best_mlflow_run(metric: str = "f1_score"):
+    """
+    Get the best performing model run based on a specified metric.
+    
+    Args:
+        metric: The metric to optimize for (default: f1_score)
+                Options: accuracy, precision, recall, f1_score, roc_auc
+    """
+    if not MLFLOW_AVAILABLE:
+        raise HTTPException(status_code=503, detail="MLflow service not available")
+    
+    try:
+        best_run = MLflowService.get_best_run(metric_name=metric)
+        
+        if best_run:
+            return {
+                "status": "success",
+                "optimized_for": metric,
+                "best_run": best_run
+            }
+        else:
+            return {
+                "status": "no_runs",
+                "message": "No evaluation runs found. Run /api/mlflow/log-evaluation first."
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/mlflow/recent-runs")
+async def get_recent_mlflow_runs(limit: int = 10):
+    """
+    Get the most recent model evaluation runs from MLflow.
+    
+    Args:
+        limit: Maximum number of runs to return (default: 10)
+    """
+    if not MLFLOW_AVAILABLE:
+        raise HTTPException(status_code=503, detail="MLflow service not available")
+    
+    try:
+        runs = MLflowService.get_recent_runs(limit=min(limit, 50))
+        
+        return {
+            "status": "success",
+            "count": len(runs),
+            "runs": runs
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/mlflow/register-model")
+async def register_model_to_mlflow():
+    """
+    Register the current XGBoost model to MLflow Model Registry.
+    
+    This creates a versioned model entry that can be used for:
+    - Model versioning and lineage tracking
+    - A/B testing different model versions
+    - Production deployment workflows
+    """
+    if not MLFLOW_AVAILABLE:
+        raise HTTPException(status_code=503, detail="MLflow service not available")
+    
+    if xgb_model is None:
+        raise HTTPException(status_code=503, detail="ML model not available")
+    
+    try:
+        # Get current model metrics for registration
+        model_path = "xgb_neo_classifier.pkl"
+        
+        if not os.path.exists(model_path):
+            raise HTTPException(status_code=404, detail="Model file not found on disk")
+        
+        # Get feature importances as metrics
+        importances = xgb_model.feature_importances_
+        metrics = {
+            "max_feature_importance": float(max(importances)),
+            "min_feature_importance": float(min(importances)),
+            "feature_count": len(importances)
+        }
+        
+        version = MLflowService.log_model_registration(
+            model_path=model_path,
+            model_name="xgb_neo_classifier",
+            metrics=metrics
+        )
+        
+        if version:
+            return {
+                "status": "success",
+                "message": f"Model registered as version {version}",
+                "model_name": "xgb_neo_classifier",
+                "version": version,
+                "mlflow_ui": "http://localhost:5001/#/models"
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Model registration failed")
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/mlflow/full-evaluation")
+async def full_mlflow_evaluation(
+    days: int = 30,
+    run_name: Optional[str] = None,
+    register_model: bool = False,
+    stage: str = "None"
+):
+    """
+    🌟 PRODUCTION-READY: Full model evaluation with artifacts and optional registration.
+    
+    This endpoint:
+    1. Evaluates the model against live NASA data
+    2. Logs all metrics (accuracy, precision, recall, F1, ROC-AUC)
+    3. Creates and logs a Confusion Matrix visualization
+    4. Creates and logs a Feature Importance plot
+    5. Logs the model with its signature (input/output schema)
+    6. Logs an input example for documentation
+    7. Optionally registers the model to the Model Registry with a stage
+    
+    Args:
+        days: Number of days of NASA data to use (default: 30)
+        run_name: Optional custom name for this MLflow run
+        register_model: If True, registers model to Model Registry
+        stage: Stage to assign if registering ("None", "Staging", "Production")
+    
+    Returns:
+        Full logging results including run_id, model_version, and artifact list
+    """
+    if not MLFLOW_AVAILABLE:
+        raise HTTPException(status_code=503, detail="MLflow service not available")
+    
+    if xgb_model is None or scaler is None:
+        raise HTTPException(status_code=503, detail="ML models not available")
+    
+    try:
+        # Run model evaluation
+        print(f"🚀 Running FULL evaluation for MLflow ({days} days of data)...")
+        evaluation_results = await evaluate_model_on_live_data(days=min(days, 60))
+        
+        # Create a sample input for signature
+        sample_input = np.array([[22.0, 0.1, 0.2, 50000.0, 500000.0]])
+        
+        # Log full evaluation with all artifacts
+        result = MLflowService.log_full_evaluation(
+            metrics=evaluation_results,
+            model=xgb_model,
+            scaler=scaler,
+            sample_input=sample_input,
+            run_name=run_name,
+            register_model=register_model,
+            model_stage=stage
+        )
+        
+        result["evaluation_metrics"] = {
+            "accuracy": evaluation_results.get("accuracy"),
+            "precision": evaluation_results.get("precision"),
+            "recall": evaluation_results.get("recall"),
+            "f1_score": evaluation_results.get("f1_score"),
+            "roc_auc": evaluation_results.get("roc_auc"),
+            "evaluation_samples": evaluation_results.get("evaluation_samples"),
+            "confusion_matrix": evaluation_results.get("confusion_matrix")
+        }
+        result["mlflow_ui"] = "http://localhost:5001"
+        
+        return result
+    
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Full evaluation failed: {str(e)}")
+
+
+@app.post("/api/mlflow/promote-model")
+async def promote_model_stage(version: str, stage: str = "Staging"):
+    """
+    Promote a model version to a new stage (Staging or Production).
+    
+    This allows you to:
+    - Move a tested model from "None" to "Staging" for QA
+    - Move a validated model from "Staging" to "Production" for live use
+    - Archive old models by moving them to "Archived"
+    
+    Args:
+        version: Model version number to promote (e.g., "1", "2")
+        stage: Target stage ("Staging", "Production", "Archived", "None")
+    """
+    if not MLFLOW_AVAILABLE:
+        raise HTTPException(status_code=503, detail="MLflow service not available")
+    
+    valid_stages = ["None", "Staging", "Production", "Archived"]
+    if stage not in valid_stages:
+        raise HTTPException(status_code=400, detail=f"Invalid stage. Must be one of: {valid_stages}")
+    
+    try:
+        success = MLflowService.transition_model_stage(
+            model_name="NASA_NEO_Classifier",
+            version=version,
+            stage=stage
+        )
+        
+        if success:
+            return {
+                "status": "success",
+                "message": f"Model version {version} promoted to {stage}",
+                "model_name": "NASA_NEO_Classifier",
+                "version": version,
+                "new_stage": stage,
+                "mlflow_ui": "http://localhost:5001/#/models/NASA_NEO_Classifier"
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Stage transition failed")
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/mlflow/compare-runs")
+async def compare_mlflow_runs(run_ids: str):
+    """
+    Compare multiple runs side by side.
+    
+    This is useful for:
+    - Comparing XGBoost vs Random Forest performance
+    - Comparing different hyperparameter configurations
+    - Identifying which model has fewer False Negatives (critical for hazard detection)
+    
+    Args:
+        run_ids: Comma-separated run IDs to compare (e.g., "abc123,def456")
+    
+    Returns:
+        Comparison data with metrics for each run and best performer per metric
+    """
+    if not MLFLOW_AVAILABLE:
+        raise HTTPException(status_code=503, detail="MLflow service not available")
+    
+    try:
+        run_id_list = [rid.strip() for rid in run_ids.split(",") if rid.strip()]
+        
+        if len(run_id_list) < 2:
+            raise HTTPException(status_code=400, detail="Need at least 2 run IDs to compare")
+        
+        if len(run_id_list) > 10:
+            raise HTTPException(status_code=400, detail="Maximum 10 runs can be compared at once")
+        
+        comparison = MLflowService.compare_runs(run_id_list)
+        
+        return {
+            "status": "success",
+            "comparison": comparison,
+            "mlflow_ui": "http://localhost:5001"
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/mlflow/registered-models")
+async def get_registered_models():
+    """
+    Get all registered models and their versions from Model Registry.
+    
+    Shows:
+    - All registered model names
+    - Each version with its stage (None/Staging/Production/Archived)
+    - Run ID that created each version
+    """
+    if not MLFLOW_AVAILABLE:
+        raise HTTPException(status_code=503, detail="MLflow service not available")
+    
+    try:
+        models = MLflowService.get_registered_models()
+        
+        return {
+            "status": "success",
+            "model_count": len(models),
+            "models": models,
+            "production_uri": MLflowService.get_production_model_uri()
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/api/rag/kb-status")
 async def get_kb_status():
@@ -1731,15 +2158,87 @@ async def search_knowledge_base_for_agent(query: str) -> List[Dict]:
     return sources
 
 
-# Create global agent instance
-neo_agent: Optional[AgentService] = None
+async def predict_hazard_for_agent(params: Dict) -> Dict:
+    """
+    XGBoost prediction function to inject into the Agent.
+    
+    This wraps the existing ML model to make predictions based on
+    asteroid parameters provided by the agent.
+    """
+    global xgb_model, scaler
+    
+    if xgb_model is None or scaler is None:
+        raise ValueError("ML models not loaded")
+    
+    try:
+        # Extract features in the correct order for the model
+        absolute_magnitude = params.get("absolute_magnitude", 25.0)
+        diameter_min = params.get("estimated_diameter_min", 0.01)
+        diameter_max = params.get("estimated_diameter_max", 0.02)
+        velocity = params.get("relative_velocity", 50000)  # kph
+        miss_distance = params.get("miss_distance", 1000000)  # km
+        
+        # Create feature array: [magnitude, diameter_min, diameter_max, velocity, miss_distance]
+        features = np.array([[
+            absolute_magnitude,
+            diameter_min,
+            diameter_max,
+            velocity,
+            miss_distance
+        ]])
+        
+        # Scale features
+        features_scaled = scaler.transform(features)
+        
+        # Get prediction and probability
+        prediction = xgb_model.predict(features_scaled)[0]
+        probabilities = xgb_model.predict_proba(features_scaled)[0]
+        
+        hazard_probability = float(probabilities[1]) if len(probabilities) > 1 else float(probabilities[0])
+        
+        # Determine risk level based on probability
+        if hazard_probability >= 0.8:
+            risk_level = "CRITICAL"
+        elif hazard_probability >= 0.5:
+            risk_level = "HIGH"
+        elif hazard_probability >= 0.25:
+            risk_level = "MODERATE"
+        else:
+            risk_level = "LOW"
+        
+        return {
+            "is_hazardous": bool(prediction),
+            "hazard_probability": round(hazard_probability, 4),
+            "confidence": round(max(probabilities) * 100, 2),
+            "risk_level": risk_level,
+            "input_features": {
+                "absolute_magnitude": absolute_magnitude,
+                "diameter_min_km": diameter_min,
+                "diameter_max_km": diameter_max,
+                "velocity_kph": velocity,
+                "miss_distance_km": miss_distance
+            },
+            "model_info": {
+                "type": "XGBoost Classifier",
+                "training_samples": 127347,
+                "accuracy": "94.18%"
+            }
+        }
+    
+    except Exception as e:
+        raise ValueError(f"Prediction failed: {str(e)}")
 
-def get_agent() -> AgentService:
-    """Get or create the agent instance."""
+
+# Create global LangGraph agent instance
+neo_agent: Optional[LangGraphAgentService] = None
+
+def get_agent() -> LangGraphAgentService:
+    """Get or create the LangGraph Robot Scientist agent instance."""
     global neo_agent
     if neo_agent is None:
-        neo_agent = create_agent(
-            knowledge_base_search_fn=search_knowledge_base_for_agent
+        neo_agent = create_langgraph_agent(
+            knowledge_base_search_fn=search_knowledge_base_for_agent,
+            ml_predict_fn=predict_hazard_for_agent
         )
     return neo_agent
 
@@ -1747,32 +2246,32 @@ def get_agent() -> AgentService:
 @app.post("/api/agent/query", response_model=AgentQueryResponse)
 async def query_agent(request: AgentQueryRequest):
     """
-    Query the Agentic RAG system.
+    Query the Robot Scientist - Autonomous Planetary Defense Agent.
     
-    This is the main endpoint for the autonomous AI agent. Unlike the basic
-    RAG endpoint, this agent can:
+    This is the main endpoint for the agentic RAG system using ReAct protocol.
+    The Robot Scientist can:
     
-    1. **Reason** about what information it needs
-    2. **Decide** which tools to use (search KB, fetch live data, calculate risk)
-    3. **Execute** tools and observe results
-    4. **Synthesize** a comprehensive response
+    1. **Think** about what information is needed (Thought phase)
+    2. **Act** by calling appropriate tools (Action phase)
+    3. **Observe** tool results and iterate if needed (Observation phase)
+    4. **Brief** mission control with synthesized intelligence (Final Answer)
     
-    The agent uses OpenAI-compatible function calling to interact with:
-    - Knowledge Base (historical asteroid data)
-    - NASA Live Feed (real-time close approach data)
-    - Risk Calculator (physics-based threat assessment)
+    Available Tools:
+    - **fetch_live_nasa_feed**: Real-time asteroid data from NASA
+    - **predict_hazard_xgboost**: ML model prediction (94.18% accuracy)
+    - **search_knowledge_base**: Historical context from Weaviate
     
     Args:
         question: Natural language question about NEOs
-        include_reasoning: If true, includes step-by-step reasoning in response
+        include_reasoning: If true, includes ReAct steps in response
     
     Returns:
-        AgentQueryResponse with answer, tools used, sources, and optionally reasoning
+        Mission briefing with analysis, tools used, and sources
     
     Example questions:
     - "What is the most dangerous asteroid approaching this week?"
-    - "Calculate the risk for an asteroid 100m wide at 20 km/s missing by 100,000 km"
-    - "Compare today's closest approach to historical data"
+    - "Is asteroid 2024 XY hazardous? Use the ML model to predict."
+    - "Compare today's closest approach to Chelyabinsk"
     """
     try:
         agent = get_agent()
@@ -1799,13 +2298,13 @@ async def query_agent(request: AgentQueryRequest):
 @app.get("/api/agent/status")
 async def get_agent_status():
     """
-    Get the status of the Agentic RAG system.
+    Get the status of the LangGraph Robot Scientist agent.
     
     Returns information about:
-    - Agent availability
-    - Available tools
+    - Agent framework (LangGraph)
+    - Available tools and their status
+    - ML model availability
     - Knowledge base status
-    - LLM configuration
     """
     kb_count = 0
     if weaviate_client:
@@ -1818,41 +2317,68 @@ async def get_agent_status():
     else:
         kb_count = len(neo_documents)
     
+    ml_available = xgb_model is not None and scaler is not None
+    
     return {
         "status": "operational",
-        "agent_type": "Agentic RAG with Tool Calling",
+        "agent_name": "Robot Scientist",
+        "framework": {
+            "name": "LangGraph",
+            "version": ">= 0.2.0",
+            "ecosystem": "LangChain",
+            "architecture": "StateGraph with conditional edges"
+        },
+        "reasoning_protocol": "ReAct (Reasoning + Acting)",
         "llm_model": CHAT_MODEL,
         "llm_provider": "OpenRouter",
         "available_tools": [
             {
-                "name": "search_knowledge_base",
-                "description": "Search vector database for historical NEO data",
-                "status": "available" if (weaviate_client or neo_documents) else "empty"
+                "name": "fetch_live_nasa_feed",
+                "description": "Fetch real-time asteroid data from NASA NeoWs API",
+                "status": "available",
+                "priority": "Use first for current/future asteroid queries"
             },
             {
-                "name": "fetch_live_nasa_feed", 
-                "description": "Fetch real-time data from NASA NeoWs API",
-                "status": "available"
+                "name": "predict_hazard_xgboost",
+                "description": "XGBoost ML model trained on 127,347 asteroids (94.18% accuracy)",
+                "status": "available" if ml_available else "unavailable",
+                "priority": "Use for hazard classification instead of manual calculations"
             },
             {
-                "name": "calculate_risk",
-                "description": "Physics-based risk assessment calculator",
-                "status": "available"
+                "name": "search_knowledge_base", 
+                "description": "Search Weaviate for historical NEO data and past events",
+                "status": "available" if (weaviate_client or neo_documents) else "empty",
+                "priority": "Use for historical context and analogies"
             }
         ],
+        "ml_model": {
+            "loaded": ml_available,
+            "type": "XGBoost Classifier",
+            "training_samples": 127347,
+            "accuracy": "94.18%"
+        },
         "knowledge_base": {
             "backend": "weaviate" if weaviate_client else "in-memory",
             "document_count": kb_count,
             "semantic_search": embedding_model is not None
         },
+        "graph_structure": {
+            "nodes": ["agent", "tools"],
+            "entry_point": "agent",
+            "conditional_edges": "agent -> tools | END",
+            "loop_edge": "tools -> agent"
+        },
         "max_iterations": 5,
         "capabilities": [
-            "Multi-tool reasoning",
-            "Real-time data access",
-            "Historical data retrieval",
-            "Physics calculations",
-            "Risk assessment"
-        ]
+            "LangGraph StateGraph",
+            "ReAct reasoning loop",
+            "Memory/Checkpointing",
+            "Real-time NASA data access",
+            "ML-powered hazard prediction",
+            "Historical context retrieval",
+            "Mission control briefings"
+        ],
+        "premium_skill": "Agentic Engineering (LangGraph, LlamaIndex, CrewAI)"
     }
 
 

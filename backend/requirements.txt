@@ -11,3 +11,15 @@ python-dotenv
 joblib
 redis>=5.0.0
 httpx>=0.27.0
+# LangGraph - Premium Agentic Engineering Framework
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-openai>=0.2.0
+langchain-core>=0.3.0
+prometheus-fastapi-instrumentator>=7.0.0
+# MLflow - ML Experiment Tracking & Model Registry
+mlflow>=2.16.0
+# Visualization for MLflow Artifacts
+matplotlib>=3.8.0
+seaborn>=0.13.0
+pandas>=2.0.0

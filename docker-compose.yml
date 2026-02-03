@@ -3,33 +3,35 @@ version: '3.8'
 services:
   # Service 1: The Python Backend
   backend:
-    build: ./backend        # Tells Docker to look in the 'backend' folder
+    build: ./backend # Tells Docker to look in the 'backend' folder
     container_name: neo_backend
     ports:
-      - "8000:8000"         # Maps PC port 8000 to Container port 8000
+      - "8000:8000" # Maps PC port 8000 to Container port 8000
     env_file:
-      - ./backend/.env      # Loads your API keys automatically
+      - ./backend/.env # Loads your API keys automatically
     environment:
       - WEAVIATE_URL=http://weaviate:8080
       - WEAVIATE_GRPC_PORT=50051
-      - REDIS_URL=redis://redis:6379/0  # Redis connection for caching
+      - REDIS_URL=redis://redis:6379/0 # Redis connection for caching
+      - MLFLOW_TRACKING_URI=http://mlflow:5001 # MLflow for experiment tracking
     volumes:
-      - ./backend:/app      # Syncs code so you don't have to rebuild on every change
+      - ./backend:/app # Syncs code so you don't have to rebuild on every change
     depends_on:
       - weaviate
-      - redis               # Ensure Redis starts before backend
+      - redis # Ensure Redis starts before backend
+      - mlflow # Ensure MLflow starts before backend
 
   # Service 2: The React Frontend
   frontend:
-    build: ./frontend       # Tells Docker to look in the 'frontend' folder
+    build: ./frontend # Tells Docker to look in the 'frontend' folder
     container_name: neo_frontend
     ports:
-      - "5173:5173"         # Maps PC port 5173 to Container port 5173
+      - "5173:5173" # Maps PC port 5173 to Container port 5173
     depends_on:
-      - backend             # Wait for backend to start first
+      - backend # Wait for backend to start first
     volumes:
-      - ./frontend:/app     # Syncs code changes
-      - /app/node_modules   # Keeps node_modules inside the container safe
+      - ./frontend:/app # Syncs code changes
+      - /app/node_modules # Keeps node_modules inside the container safe
 
   # Service 3: Weaviate Vector Database
   weaviate:
@@ -53,15 +55,55 @@ services:
     image: redis:7-alpine
     container_name: neo_redis
     ports:
-      - "6379:6379"         # Expose Redis port for local debugging
+      - "6379:6379" # Expose Redis port for local debugging
     volumes:
-      - redis_data:/data    # Persistent storage survives container restarts
-    command: redis-server --appendonly yes  # Enable AOF persistence
+      - redis_data:/data # Persistent storage survives container restarts
+    command: redis-server --appendonly yes # Enable AOF persistence
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 10s
       timeout: 5s
       retries: 5
 
+  # Service 5: Prometheus (Metrics Collection)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: neo_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    depends_on:
+      - backend
+
+  # Service 6: Grafana (Visualization)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: neo_grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - prometheus
+    volumes:
+      - grafana_data:/var/lib/grafana
+
+  # Service 7: MLflow (ML Experiment Tracking & Model Registry)
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.16.0
+    container_name: neo_mlflow
+    ports:
+      - "5001:5001"
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow:5001
+    volumes:
+      - mlflow_data:/mlflow
+    command: mlflow server --host 0.0.0.0 --port 5001 --backend-store-uri sqlite:///mlflow/mlflow.db --default-artifact-root /mlflow/artifacts
+
 volumes:
-  redis_data:               # Named volume for Redis persistence
+  redis_data: # Named volume for Redis persistence
+  grafana_data: # Named volume for Grafana persistence
+  mlflow_data: # Named volume for MLflow experiments & artifacts
