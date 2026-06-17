@@ -300,6 +300,32 @@ def load_models():
     
     print("="*70 + "\n")
 
+def predict_hazard_sync(
+    absolute_magnitude: float,
+    diameter_min: float,
+    diameter_max: float,
+    velocity_kph: float,
+    miss_distance_km: float,
+    fallback_value: bool = False
+) -> bool:
+    """Predict hazard status using the loaded XGBoost model and scaler"""
+    global xgb_model, scaler
+    if xgb_model is None or scaler is None:
+        return fallback_value
+    try:
+        features = np.array([[
+            absolute_magnitude,
+            diameter_min,
+            diameter_max,
+            velocity_kph,
+            miss_distance_km
+        ]])
+        features_scaled = scaler.transform(features)
+        return bool(xgb_model.predict(features_scaled)[0])
+    except Exception as e:
+        print(f"Prediction fallback due to error: {e}")
+        return fallback_value
+
 # Initialize on startup
 load_models()
 init_weaviate()
@@ -678,6 +704,16 @@ async def get_advanced_analytics(days: int = 30):
             risk_cat = "LOW"
             priority = "ROUTINE"
         
+        # Use ML model to predict hazard status if available
+        is_hazardous_pred = predict_hazard_sync(
+            absolute_magnitude=neo.absolute_magnitude if neo.absolute_magnitude is not None else 22.0,
+            diameter_min=neo.estimated_diameter_min,
+            diameter_max=neo.estimated_diameter_max,
+            velocity_kph=neo.relative_velocity,
+            miss_distance_km=neo.miss_distance,
+            fallback_value=neo.is_hazardous
+        )
+
         scored_neos.append(RiskScoredNEO(
             neo_id=neo.neo_id,
             name=neo.name,
@@ -689,7 +725,7 @@ async def get_advanced_analytics(days: int = 30):
             diameter_km=diameter,
             velocity_kms=velocity_kms,
             miss_distance_km=neo.miss_distance,
-            is_hazardous=neo.is_hazardous,
+            is_hazardous=is_hazardous_pred,
             risk_category=risk_cat,
             follow_up_priority=priority,
             absolute_magnitude=neo.absolute_magnitude
@@ -1674,6 +1710,16 @@ async def auto_index_from_nasa():
             else:
                 risk_cat = "LOW"
             
+            # Use ML model to predict hazard status if available
+            is_hazardous_pred = predict_hazard_sync(
+                absolute_magnitude=neo.absolute_magnitude if neo.absolute_magnitude is not None else 22.0,
+                diameter_min=neo.estimated_diameter_min,
+                diameter_max=neo.estimated_diameter_max,
+                velocity_kph=neo.relative_velocity,
+                miss_distance_km=neo.miss_distance,
+                fallback_value=neo.is_hazardous
+            )
+
             content = f"""NEO Name: {neo.name}
 NEO ID: {neo.neo_id}
 Date: {neo.date}
@@ -1683,7 +1729,7 @@ Diameter: {diameter:.4f} km
 Velocity: {velocity_kms:.2f} km/s
 Miss Distance: {neo.miss_distance:.2f} km ({neo.miss_distance/384400:.3f} lunar distances)
 Kinetic Energy: {ke:.2f} Mt
-Potentially Hazardous: {'Yes' if neo.is_hazardous else 'No'}
+Potentially Hazardous: {'Yes' if is_hazardous_pred else 'No'}
 
 This is a {risk_cat.lower()} risk near-Earth object approaching on {neo.date}."""
             
@@ -1698,7 +1744,7 @@ This is a {risk_cat.lower()} risk near-Earth object approaching on {neo.date}.""
                 "velocity_kms": float(velocity_kms),
                 "miss_distance_km": float(neo.miss_distance),
                 "kinetic_energy_mt": float(ke),
-                "is_hazardous": bool(neo.is_hazardous)
+                "is_hazardous": is_hazardous_pred
             }
             
             if weaviate_client:

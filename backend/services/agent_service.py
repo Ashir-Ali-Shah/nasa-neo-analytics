@@ -134,16 +134,38 @@ async def fetch_live_nasa_feed(start_date: str, end_date: str) -> str:
                 approach_data = neo.get("close_approach_data", [{}])[0]
                 diameter = neo.get("estimated_diameter", {}).get("kilometers", {})
                 
+                # Extract features for the prediction
+                abs_mag = neo.get("absolute_magnitude_h")
+                diameter_min = diameter.get("estimated_diameter_min")
+                diameter_max = diameter.get("estimated_diameter_max")
+                velocity_kph = float(approach_data.get("relative_velocity", {}).get("kilometers_per_hour", 0))
+                miss_distance_km = float(approach_data.get("miss_distance", {}).get("kilometers", 0))
+                
+                # Predict hazard using ML model if available
+                is_hazardous_pred = neo.get("is_potentially_hazardous_asteroid", False)
+                if _ml_predict_fn is not None and abs_mag is not None and diameter_min is not None and diameter_max is not None:
+                    try:
+                        pred_res = await _ml_predict_fn({
+                            "absolute_magnitude": float(abs_mag),
+                            "estimated_diameter_min": float(diameter_min),
+                            "estimated_diameter_max": float(diameter_max),
+                            "relative_velocity": velocity_kph,
+                            "miss_distance": miss_distance_km
+                        })
+                        is_hazardous_pred = pred_res.get("is_hazardous", is_hazardous_pred)
+                    except Exception as pred_err:
+                        logger.error(f"Error predicting hazard for live feed: {pred_err}")
+                
                 asteroids.append({
                     "id": neo.get("id"),
                     "name": neo.get("name"),
                     "date": date,
-                    "is_potentially_hazardous": neo.get("is_potentially_hazardous_asteroid", False),
-                    "absolute_magnitude": neo.get("absolute_magnitude_h"),
-                    "diameter_km_min": diameter.get("estimated_diameter_min"),
-                    "diameter_km_max": diameter.get("estimated_diameter_max"),
-                    "velocity_kph": float(approach_data.get("relative_velocity", {}).get("kilometers_per_hour", 0)),
-                    "miss_distance_km": float(approach_data.get("miss_distance", {}).get("kilometers", 0)),
+                    "is_potentially_hazardous": is_hazardous_pred,
+                    "absolute_magnitude": abs_mag,
+                    "diameter_km_min": diameter_min,
+                    "diameter_km_max": diameter_max,
+                    "velocity_kph": velocity_kph,
+                    "miss_distance_km": miss_distance_km,
                     "miss_distance_lunar": float(approach_data.get("miss_distance", {}).get("lunar", 0))
                 })
         
