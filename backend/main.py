@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, validator
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 import requests
 import uvicorn
@@ -36,7 +36,8 @@ from core.calculations import (
     calculate_impact_probability as calc_ip,
     calculate_risk_score as calc_rs,
     get_risk_category,
-    full_risk_assessment
+    full_risk_assessment,
+    impact_corridor_analysis as core_impact_analysis
 )
 
 # Try to import MLflow service
@@ -237,6 +238,20 @@ def get_semantic_embedding(text: str) -> List[float]:
         print(f"Embedding error: {str(e)}")
         return create_simple_embedding(text)
 
+def get_semantic_embeddings_batch(texts: List[str]) -> List[List[float]]:
+    """Generate semantic embeddings for a batch of texts"""
+    global embedding_model
+    
+    try:
+        if embedding_model is not None:
+            embeddings = embedding_model.encode(texts, convert_to_tensor=False)
+            return embeddings.tolist()
+        else:
+            return [create_simple_embedding(text) for text in texts]
+    except Exception as e:
+        print(f"Batch embedding error: {str(e)}")
+        return [create_simple_embedding(text) for text in texts]
+
 def create_simple_embedding(text: str, dim: int = 384) -> List[float]:
     """Fallback simple embedding"""
     text = text.lower()
@@ -299,6 +314,43 @@ def load_models():
                 print(f"✗ Load failed: {e}")
     
     print("="*70 + "\n")
+def _run_ml_prediction(
+    absolute_magnitude: float,
+    diameter_min: float,
+    diameter_max: float,
+    velocity_kph: float,
+    miss_distance_km: float
+) -> Dict[str, Any]:
+    """Core ML prediction logic shared across endpoints and agents."""
+    global xgb_model, scaler
+    if xgb_model is None or scaler is None:
+        raise ValueError("ML models not available")
+        
+    features = np.array([[
+        absolute_magnitude,
+        diameter_min,
+        diameter_max,
+        velocity_kph,
+        miss_distance_km
+    ]])
+    
+    features_scaled = scaler.transform(features)
+    is_hazardous = bool(xgb_model.predict(features_scaled)[0])
+    probabilities = xgb_model.predict_proba(features_scaled)[0]
+    
+    return {
+        "is_hazardous": is_hazardous,
+        "hazardous_probability": float(probabilities[1]) if len(probabilities) > 1 else float(probabilities[0]),
+        "confidence": float(max(probabilities)),
+        "scaled_features": features_scaled[0].tolist(),
+        "input_features": {
+            "absolute_magnitude": absolute_magnitude,
+            "estimated_diameter_min": diameter_min,
+            "estimated_diameter_max": diameter_max,
+            "relative_velocity": velocity_kph,
+            "miss_distance": miss_distance_km
+        }
+    }
 
 def predict_hazard_sync(
     absolute_magnitude: float,
@@ -309,19 +361,11 @@ def predict_hazard_sync(
     fallback_value: bool = False
 ) -> bool:
     """Predict hazard status using the loaded XGBoost model and scaler"""
-    global xgb_model, scaler
-    if xgb_model is None or scaler is None:
-        return fallback_value
     try:
-        features = np.array([[
-            absolute_magnitude,
-            diameter_min,
-            diameter_max,
-            velocity_kph,
-            miss_distance_km
-        ]])
-        features_scaled = scaler.transform(features)
-        return bool(xgb_model.predict(features_scaled)[0])
+        res = _run_ml_prediction(
+            absolute_magnitude, diameter_min, diameter_max, velocity_kph, miss_distance_km
+        )
+        return res["is_hazardous"]
     except Exception as e:
         print(f"Prediction fallback due to error: {e}")
         return fallback_value
@@ -410,22 +454,6 @@ class RAGQueryResponse(BaseModel):
     kb_document_count: int
 
 # Helper functions
-def fetch_nasa_data(start_date: str, end_date: str) -> dict:
-    """Fetch data from NASA API (synchronous fallback)"""
-    params = {
-        'start_date': start_date,
-        'end_date': end_date,
-        'api_key': NASA_API_KEY
-    }
-    
-    try:
-        response = requests.get(NASA_API_URL, params=params, timeout=30)
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=500, detail=f"NASA API error: {str(e)}")
-
-
 async def fetch_nasa_data_cached(start_date: str, end_date: str) -> dict:
     """
     Fetch data from NASA API with Redis caching.
@@ -461,80 +489,6 @@ def parse_neo_data(api_response: dict) -> List[NEOData]:
                 records.append(record)
     
     return records
-
-def calculate_kinetic_energy(diameter_km: float, velocity_kms: float) -> float:
-    """Calculate kinetic energy in megatons"""
-    density_kg_m3 = 2600
-    radius_m = (diameter_km * 1000) / 2
-    volume_m3 = (4/3) * math.pi * (radius_m ** 3)
-    mass_kg = volume_m3 * density_kg_m3
-    velocity_ms = velocity_kms * 1000
-    energy_joules = 0.5 * mass_kg * (velocity_ms ** 2)
-    energy_mt = energy_joules / 4.184e15
-    return energy_mt
-
-def calculate_impact_probability(miss_distance_km: float, diameter_km: float) -> float:
-    """Calculate impact probability"""
-    normalized_distance = miss_distance_km / LUNAR_DISTANCE_KM
-    if normalized_distance < 0.1:
-        prob = 1.0 / (1.0 + normalized_distance * 100)
-    else:
-        prob = math.exp(-normalized_distance * 10) * 0.01
-    prob *= (diameter_km / 1.0)
-    return min(prob, 1.0)
-
-def calculate_risk_score(miss_distance_km: float, kinetic_energy_mt: float, 
-                        impact_probability: float, w1: float = 0.4, 
-                        w2: float = 0.35, w3: float = 0.25) -> float:
-    """Calculate composite risk score"""
-    lunar_distances = miss_distance_km / LUNAR_DISTANCE_KM
-    component1 = w1 * (1.0 / max(lunar_distances, 0.001))
-    component2 = w2 * math.log10(max(kinetic_energy_mt, 0.001))
-    component3 = w3 * impact_probability
-    risk_score = component1 + component2 + component3
-    return max(risk_score, 0)
-
-def impact_corridor_analysis(neo: RiskScoredNEO) -> ImpactAnalysis:
-    """Analyze impact corridor"""
-    uncertainty_km = neo.miss_distance_km * 0.05
-    corridor_width = 2 * uncertainty_km
-    
-    num_locations = 10
-    geographic_footprint = []
-    potential_locations = []
-    
-    for i in range(num_locations):
-        lat = np.random.uniform(-60, 60)
-        lon = np.random.uniform(-180, 180)
-        impact_energy = neo.kinetic_energy_mt * np.random.uniform(0.8, 1.0)
-        crater_diameter = 0.02 * (impact_energy ** 0.33) * (neo.diameter_km ** 0.33)
-        
-        geographic_footprint.append({
-            'latitude': float(lat),
-            'longitude': float(lon),
-            'impact_energy_mt': float(impact_energy),
-            'crater_diameter_km': float(crater_diameter),
-            'destruction_radius_km': float(crater_diameter * 10)
-        })
-        
-        if -30 <= lat <= 30:
-            if -100 <= lon <= -60:
-                potential_locations.append("North America")
-            elif -20 <= lon <= 50:
-                potential_locations.append("Europe/Africa")
-            elif 60 <= lon <= 150:
-                potential_locations.append("Asia/Pacific")
-    
-    potential_locations = list(set(potential_locations)) if potential_locations else ["Ocean"]
-    
-    return ImpactAnalysis(
-        neo_id=neo.neo_id,
-        name=neo.name,
-        impact_probability=neo.impact_probability,
-        impact_corridor_width_km=corridor_width,
-        geographic_footprint=geographic_footprint,
-        potential_impact_locations=potential_locations
-    )
 
 # API Endpoints
 @app.get("/")
@@ -687,21 +641,18 @@ async def get_advanced_analytics(days: int = 30):
         diameter = (neo.estimated_diameter_min + neo.estimated_diameter_max) / 2
         velocity_kms = neo.relative_velocity / 3600
         
-        ke = calculate_kinetic_energy(diameter, velocity_kms)
-        ip = calculate_impact_probability(neo.miss_distance, diameter)
-        rs = calculate_risk_score(neo.miss_distance, ke, ip)
+        ke = calc_ke(diameter, velocity_kms)
+        ip = calc_ip(neo.miss_distance, diameter)
+        rs = calc_rs(neo.miss_distance, ke, ip)
         
-        if rs > 10:
-            risk_cat = "CRITICAL"
+        risk_cat = get_risk_category(rs)
+        if risk_cat == "CRITICAL":
             priority = "IMMEDIATE"
-        elif rs > 5:
-            risk_cat = "HIGH"
+        elif risk_cat == "HIGH":
             priority = "URGENT"
-        elif rs > 2:
-            risk_cat = "MODERATE"
+        elif risk_cat == "MODERATE":
             priority = "SCHEDULED"
         else:
-            risk_cat = "LOW"
             priority = "ROUTINE"
         
         # Use ML model to predict hazard status if available
@@ -735,7 +686,17 @@ async def get_advanced_analytics(days: int = 30):
     top_50 = scored_neos[:50]
     
     closest_10 = sorted(scored_neos, key=lambda x: x.miss_distance_km)[:10]
-    impact_analyses = [impact_corridor_analysis(neo) for neo in closest_10]
+    impact_analyses = []
+    for neo in closest_10:
+        res = core_impact_analysis(
+            neo_id=neo.neo_id,
+            name=neo.name,
+            miss_distance_km=neo.miss_distance_km,
+            kinetic_energy_mt=neo.kinetic_energy_mt,
+            diameter_km=neo.diameter_km,
+            impact_probability=neo.impact_probability
+        )
+        impact_analyses.append(ImpactAnalysis(**res))
     
     # Calculate temporal clusters dynamically
     date_to_high_risk = defaultdict(list)
@@ -815,75 +776,72 @@ async def get_advanced_analytics(days: int = 30):
 @app.post("/api/neo/predict", response_model=PredictionResponse)
 async def predict_hazardous(input_data: PredictionInput):
     """Predict if NEO is hazardous"""
-    if xgb_model is None or scaler is None:
-        raise HTTPException(status_code=503, detail="ML models not available")
-    
     try:
-        features = np.array([[
+        res = _run_ml_prediction(
             input_data.absolute_magnitude,
             input_data.estimated_diameter_min,
             input_data.estimated_diameter_max,
             input_data.relative_velocity,
             input_data.miss_distance
-        ]])
-        
-        features_scaled = scaler.transform(features)
-        prediction = xgb_model.predict(features_scaled)[0]
-        probabilities = xgb_model.predict_proba(features_scaled)[0]
-        
-        hazardous_probability = float(probabilities[1])
-        confidence = float(max(probabilities))
-        
-        if hazardous_probability >= 0.8:
-            risk_level = "CRITICAL"
-            interpretation = f"Extremely high probability ({hazardous_probability*100:.2f}%) of being hazardous."
-        elif hazardous_probability >= 0.6:
-            risk_level = "HIGH"
-            interpretation = f"High probability ({hazardous_probability*100:.2f}%) of being hazardous."
-        elif hazardous_probability >= 0.4:
-            risk_level = "MODERATE"
-            interpretation = f"Moderate probability ({hazardous_probability*100:.2f}%) of being hazardous."
-        else:
-            risk_level = "LOW"
-            interpretation = f"Low probability ({hazardous_probability*100:.2f}%) of being hazardous."
-        
-        # Log prediction to MLflow for monitoring
-        if MLFLOW_AVAILABLE:
-            try:
-                MLflowService.log_prediction(
-                    input_features={
-                        'absolute_magnitude': input_data.absolute_magnitude,
-                        'estimated_diameter_min': input_data.estimated_diameter_min,
-                        'estimated_diameter_max': input_data.estimated_diameter_max,
-                        'relative_velocity': input_data.relative_velocity,
-                        'miss_distance': input_data.miss_distance
-                    },
-                    prediction=bool(prediction),
-                    probability=hazardous_probability,
-                    confidence=confidence,
-                    risk_level=risk_level
-                )
-            except Exception as mlflow_error:
-                print(f"MLflow logging error (non-critical): {mlflow_error}")
-        
-        return PredictionResponse(
-            is_hazardous=bool(prediction),
-            probability=hazardous_probability,
-            confidence=confidence,
-            risk_level=risk_level,
-            input_features={
-                'absolute_magnitude': input_data.absolute_magnitude,
-                'estimated_diameter_min': input_data.estimated_diameter_min,
-                'estimated_diameter_max': input_data.estimated_diameter_max,
-                'relative_velocity': input_data.relative_velocity,
-                'miss_distance': input_data.miss_distance
-            },
-            scaled_features=features_scaled[0].tolist(),
-            interpretation=interpretation
         )
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+        
+    hazardous_probability = res["hazardous_probability"]
+    confidence = res["confidence"]
+    prediction = res["is_hazardous"]
+    features_scaled = res["scaled_features"]
     
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+
+    if hazardous_probability >= 0.8:
+        risk_level = "CRITICAL"
+        interpretation = f"Extremely high probability ({hazardous_probability*100:.2f}%) of being hazardous."
+    elif hazardous_probability >= 0.6:
+        risk_level = "HIGH"
+        interpretation = f"High probability ({hazardous_probability*100:.2f}%) of being hazardous."
+    elif hazardous_probability >= 0.4:
+        risk_level = "MODERATE"
+        interpretation = f"Moderate probability ({hazardous_probability*100:.2f}%) of being hazardous."
+    else:
+        risk_level = "LOW"
+        interpretation = f"Low probability ({hazardous_probability*100:.2f}%) of being hazardous."
+    # Log prediction to MLflow for monitoring
+    if MLFLOW_AVAILABLE:
+        try:
+            MLflowService.log_prediction(
+                input_features={
+                    'absolute_magnitude': input_data.absolute_magnitude,
+                    'estimated_diameter_min': input_data.estimated_diameter_min,
+                    'estimated_diameter_max': input_data.estimated_diameter_max,
+                    'relative_velocity': input_data.relative_velocity,
+                    'miss_distance': input_data.miss_distance
+                },
+                prediction=bool(prediction),
+                probability=hazardous_probability,
+                confidence=confidence,
+                risk_level=risk_level
+            )
+        except Exception as mlflow_error:
+            print(f"MLflow logging error (non-critical): {mlflow_error}")
+    
+    # We need to reshape scaled_features since we get it as a 1D list from the helper
+    scaled_features_list = features_scaled if isinstance(features_scaled, list) else features_scaled.tolist()
+    
+    return PredictionResponse(
+        is_hazardous=bool(prediction),
+        probability=hazardous_probability,
+        confidence=confidence,
+        risk_level=risk_level,
+        input_features={
+            'absolute_magnitude': input_data.absolute_magnitude,
+            'estimated_diameter_min': input_data.estimated_diameter_min,
+            'estimated_diameter_max': input_data.estimated_diameter_max,
+            'relative_velocity': input_data.relative_velocity,
+            'miss_distance': input_data.miss_distance
+        },
+        scaled_features=scaled_features_list,
+        interpretation=interpretation
+    )
 
 @app.get("/api/neo/model-status")
 async def get_model_status():
@@ -1656,12 +1614,12 @@ async def auto_index_from_nasa():
     
     try:
         end_date = datetime.now()
-        start_date = end_date - timedelta(days=30)
+        start_date = end_date - timedelta(days=7)
         
         all_records = []
         current_start = start_date
         
-        for chunk in range(5):
+        for chunk in range(2):
             chunk_end = min(current_start + timedelta(days=6), end_date)
             start_str = current_start.strftime('%Y-%m-%d')
             end_str = chunk_end.strftime('%Y-%m-%d')
@@ -1692,14 +1650,16 @@ async def auto_index_from_nasa():
                 unique_records.append(record)
         
         indexed_count = 0
+        docs_to_insert = []
+        contents_to_embed = []
         
         for neo in unique_records:
             diameter = (neo.estimated_diameter_min + neo.estimated_diameter_max) / 2
             velocity_kms = neo.relative_velocity / 3600
             
-            ke = calculate_kinetic_energy(diameter, velocity_kms)
-            ip = calculate_impact_probability(neo.miss_distance, diameter)
-            rs = calculate_risk_score(neo.miss_distance, ke, ip)
+            ke = calc_ke(diameter, velocity_kms)
+            ip = calc_ip(neo.miss_distance, diameter)
+            rs = calc_rs(neo.miss_distance, ke, ip)
             
             if rs > 10:
                 risk_cat = "CRITICAL"
@@ -1747,22 +1707,28 @@ This is a {risk_cat.lower()} risk near-Earth object approaching on {neo.date}.""
                 "is_hazardous": is_hazardous_pred
             }
             
-            if weaviate_client:
-                try:
-                    embedding = get_semantic_embedding(content)
-                    collection = weaviate_client.collections.get("NEODocument")
-                    collection.data.insert(
-                        properties=doc,
-                        vector=embedding
-                    )
-                    indexed_count += 1
-                except Exception as e:
-                    print(f"Weaviate insert error: {str(e)}")
-                    neo_documents.append(doc)
-                    indexed_count += 1
-            else:
-                neo_documents.append(doc)
-                indexed_count += 1
+            docs_to_insert.append(doc)
+            contents_to_embed.append(content)
+            
+        if weaviate_client and docs_to_insert:
+            try:
+                embeddings = get_semantic_embeddings_batch(contents_to_embed)
+                collection = weaviate_client.collections.get("NEODocument")
+                
+                with collection.batch.dynamic() as batch:
+                    for doc, emb in zip(docs_to_insert, embeddings):
+                        batch.add_object(
+                            properties=doc,
+                            vector=emb
+                        )
+                indexed_count += len(docs_to_insert)
+            except Exception as e:
+                print(f"Weaviate batch insert error: {str(e)}")
+                neo_documents.extend(docs_to_insert)
+                indexed_count += len(docs_to_insert)
+        elif docs_to_insert:
+            neo_documents.extend(docs_to_insert)
+            indexed_count += len(docs_to_insert)
         
         total_count = 0
         if weaviate_client:
@@ -2213,34 +2179,18 @@ async def predict_hazard_for_agent(params: Dict) -> Dict:
     """
     global xgb_model, scaler
     
-    if xgb_model is None or scaler is None:
-        raise ValueError("ML models not loaded")
-    
     try:
-        # Extract features in the correct order for the model
-        absolute_magnitude = params.get("absolute_magnitude", 25.0)
-        diameter_min = params.get("estimated_diameter_min", 0.01)
-        diameter_max = params.get("estimated_diameter_max", 0.02)
-        velocity = params.get("relative_velocity", 50000)  # kph
-        miss_distance = params.get("miss_distance", 1000000)  # km
+        res = _run_ml_prediction(
+            params.get("absolute_magnitude", 25.0),
+            params.get("estimated_diameter_min", 0.01),
+            params.get("estimated_diameter_max", 0.02),
+            params.get("relative_velocity", 50000),
+            params.get("miss_distance", 1000000)
+        )
         
-        # Create feature array: [magnitude, diameter_min, diameter_max, velocity, miss_distance]
-        features = np.array([[
-            absolute_magnitude,
-            diameter_min,
-            diameter_max,
-            velocity,
-            miss_distance
-        ]])
-        
-        # Scale features
-        features_scaled = scaler.transform(features)
-        
-        # Get prediction and probability
-        prediction = xgb_model.predict(features_scaled)[0]
-        probabilities = xgb_model.predict_proba(features_scaled)[0]
-        
-        hazard_probability = float(probabilities[1]) if len(probabilities) > 1 else float(probabilities[0])
+        hazard_probability = res["hazardous_probability"]
+        prediction = res["is_hazardous"]
+        confidence = res["confidence"]
         
         # Determine risk level based on probability
         if hazard_probability >= 0.8:
@@ -2255,15 +2205,9 @@ async def predict_hazard_for_agent(params: Dict) -> Dict:
         return {
             "is_hazardous": bool(prediction),
             "hazard_probability": round(hazard_probability, 4),
-            "confidence": round(max(probabilities) * 100, 2),
+            "confidence": round(confidence * 100, 2),
             "risk_level": risk_level,
-            "input_features": {
-                "absolute_magnitude": absolute_magnitude,
-                "diameter_min_km": diameter_min,
-                "diameter_max_km": diameter_max,
-                "velocity_kph": velocity,
-                "miss_distance_km": miss_distance
-            },
+            "input_features": res["input_features"],
             "model_info": {
                 "type": "XGBoost Classifier",
                 "training_samples": 127347,

@@ -8,7 +8,8 @@ These functions are designed to be tool-compatible for the Agentic RAG system.
 """
 
 import math
-from typing import Dict, Any
+import numpy as np
+from typing import Dict, Any, List
 
 # Constants
 LUNAR_DISTANCE_KM = 384400
@@ -98,7 +99,7 @@ def calculate_risk_score(
     """
     lunar_distances = miss_distance_km / LUNAR_DISTANCE_KM
     component1 = w1 * (1.0 / max(lunar_distances, 0.001))
-    component2 = w2 * math.log10(max(kinetic_energy_mt, 0.001))
+    component2 = w2 * math.log10(max(kinetic_energy_mt, 1.0))
     component3 = w3 * impact_probability
     risk_score = component1 + component2 + component3
     return max(risk_score, 0)
@@ -192,3 +193,53 @@ def _generate_assessment_notes(category: str, lunar_dist: float, energy_mt: floa
         notes.append("Priority tracking recommended")
     
     return "; ".join(notes) if notes else "Routine monitoring"
+
+
+def impact_corridor_analysis(
+    neo_id: int,
+    name: str,
+    miss_distance_km: float,
+    kinetic_energy_mt: float,
+    diameter_km: float,
+    impact_probability: float
+) -> Dict[str, Any]:
+    """Analyze impact corridor and return as a dictionary."""
+    uncertainty_km = miss_distance_km * 0.05
+    corridor_width = 2 * uncertainty_km
+    
+    num_locations = 10
+    geographic_footprint = []
+    potential_locations = []
+    
+    for i in range(num_locations):
+        lat = np.random.uniform(-60, 60)
+        lon = np.random.uniform(-180, 180)
+        impact_energy = kinetic_energy_mt * np.random.uniform(0.8, 1.0)
+        crater_diameter = 0.02 * (impact_energy ** 0.33) * (diameter_km ** 0.33)
+        
+        geographic_footprint.append({
+            'latitude': float(lat),
+            'longitude': float(lon),
+            'impact_energy_mt': float(impact_energy),
+            'crater_diameter_km': float(crater_diameter),
+            'destruction_radius_km': float(crater_diameter * 10)
+        })
+        
+        if -30 <= lat <= 30:
+            if -100 <= lon <= -60:
+                potential_locations.append("North America")
+            elif -20 <= lon <= 50:
+                potential_locations.append("Europe/Africa")
+            elif 60 <= lon <= 150:
+                potential_locations.append("Asia/Pacific")
+    
+    potential_locations = list(set(potential_locations)) if potential_locations else ["Ocean"]
+    
+    return {
+        "neo_id": neo_id,
+        "name": name,
+        "impact_probability": impact_probability,
+        "impact_corridor_width_km": corridor_width,
+        "geographic_footprint": geographic_footprint,
+        "potential_impact_locations": potential_locations
+    }

@@ -14,3 +14,7 @@ env/
 
 # Ignore Mac system files
 .DS_Store
+**/.DS_Store
+
+# Ignore build output
+**/dist

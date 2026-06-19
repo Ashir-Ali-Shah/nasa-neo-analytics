@@ -2,6 +2,12 @@
 
 A full-stack planetary defense analytics platform that tracks Near-Earth Objects (asteroids) using NASA's NeoWs API. It features an interactive dashboard for real-time tracking, an AI chatbot for data analysis, and a high-performance Machine Learning model to predict hazardous asteroids.
 
+## 🏆 Engineering Highlights (CV Portfolio)
+- **Architectural Refactoring**: Reduced frontend technical debt by splitting an 1,800+ line monolithic React entry-point into modular, single-responsibility Tab components (`RiskTab`, `PredictTab`, `ChatTab`). Eliminated backend DRY violations by extracting physics math to `core/calculations.py`.
+- **Docker Orchestration**: Containerized a multi-service system using **Docker Compose** featuring FastAPI, React, Weaviate Vector DB, Redis caching, MLflow model tracking, and Prometheus/Grafana monitoring.
+- **High-Performance ML Model**: Integrated an XGBoost classifier achieving **94.18% accuracy** on 127k+ asteroid records. Model is calibrated for **100% recall (0 false negatives)** on live NASA NeoWs feeds to ensure critical hazard alerts are never missed.
+- **Dynamic Verification Endpoint**: Built a live evaluation endpoint leveraging Redis look-aside caching to reduce latency to ~1.7s when dynamically testing real-world asteroid feeds against the ML pipeline.
+
 
 ## 🤖 Robot Scientist - LangGraph Agentic RAG
 

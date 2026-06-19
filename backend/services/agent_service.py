@@ -69,13 +69,16 @@ You are the "Robot Scientist," an autonomous planetary defense agent powered by 
 - **Final Answer**: Synthesize findings into a mission-control briefing.
 
 ### RESPONSE FORMAT
-- Use **bold** for asteroid names and critical metrics
-- Use bullet points for key statistics
-- Include risk level prominently (CRITICAL/HIGH/MODERATE/LOW)
-- Reference the ML model's prediction when available
+- Provide EXTREMELY CONCISE, direct answers.
+- Speak in simple, non-technical terms. 
+- AVOID using excessive numbers, probabilities, or complex statistics. People won't understand them. Use descriptive words (e.g., "high risk", "large size").
+- DO NOT use conversational filler (e.g., "Here is the data...").
+- Use **bold** for asteroid names.
+- Include risk level prominently (CRITICAL/HIGH/MODERATE/LOW).
+- Include risk level prominently (CRITICAL/HIGH/MODERATE/LOW).
 
 ### TONE
-Analytical, urgent but calm, and scientifically rigorous.
+Analytical, urgent but calm, and scientifically rigorous. Maximize brevity.
 
 ### CURRENT DATE
 Today is: {current_date}
@@ -138,8 +141,10 @@ async def fetch_live_nasa_feed(start_date: str, end_date: str) -> str:
                 abs_mag = neo.get("absolute_magnitude_h")
                 diameter_min = diameter.get("estimated_diameter_min")
                 diameter_max = diameter.get("estimated_diameter_max")
-                velocity_kph = float(approach_data.get("relative_velocity", {}).get("kilometers_per_hour", 0))
-                miss_distance_km = float(approach_data.get("miss_distance", {}).get("kilometers", 0))
+                vel_data = approach_data.get("relative_velocity") or {}
+                velocity_kph = float(vel_data.get("kilometers_per_hour", 0))
+                miss_data = approach_data.get("miss_distance") or {}
+                miss_distance_km = float(miss_data.get("kilometers", 0))
                 
                 # Predict hazard using ML model if available
                 is_hazardous_pred = neo.get("is_potentially_hazardous_asteroid", False)
@@ -187,10 +192,14 @@ async def fetch_live_nasa_feed(start_date: str, end_date: str) -> str:
 @tool
 async def predict_hazard_xgboost(
     absolute_magnitude: float,
-    estimated_diameter_min: float,
-    estimated_diameter_max: float,
-    relative_velocity: float,
-    miss_distance: float
+    estimated_diameter_min: Optional[float] = None,
+    estimated_diameter_max: Optional[float] = None,
+    relative_velocity: Optional[float] = None,
+    miss_distance: Optional[float] = None,
+    diameter_km_min: Optional[float] = None,
+    diameter_km_max: Optional[float] = None,
+    velocity_kph: Optional[float] = None,
+    miss_distance_km: Optional[float] = None
 ) -> str:
     """
     Use the trained XGBoost ML model to predict if an asteroid is potentially hazardous.
@@ -200,10 +209,10 @@ async def predict_hazard_xgboost(
     
     Args:
         absolute_magnitude: Absolute magnitude (H) of the asteroid. Lower = larger. Range: 15-30.
-        estimated_diameter_min: Minimum estimated diameter in kilometers
-        estimated_diameter_max: Maximum estimated diameter in kilometers
-        relative_velocity: Relative velocity in kilometers per hour
-        miss_distance: Miss distance in kilometers
+        estimated_diameter_min: Minimum estimated diameter in kilometers (also accepts diameter_km_min)
+        estimated_diameter_max: Maximum estimated diameter in kilometers (also accepts diameter_km_max)
+        relative_velocity: Relative velocity in kilometers per hour (also accepts velocity_kph)
+        miss_distance: Miss distance in kilometers (also accepts miss_distance_km)
     
     Returns:
         JSON string with hazard prediction, probability, confidence, and risk level
@@ -217,13 +226,19 @@ async def predict_hazard_xgboost(
             "recommendation": "Use NASA's is_potentially_hazardous flag as fallback."
         })
     
+    # Handle alternative names provided by LLM mapping from fetch_live_nasa_feed
+    d_min = estimated_diameter_min if estimated_diameter_min is not None else (diameter_km_min or 0.0)
+    d_max = estimated_diameter_max if estimated_diameter_max is not None else (diameter_km_max or 0.0)
+    vel = relative_velocity if relative_velocity is not None else (velocity_kph or 0.0)
+    dist = miss_distance if miss_distance is not None else (miss_distance_km or 0.0)
+    
     try:
         params = {
             "absolute_magnitude": absolute_magnitude,
-            "estimated_diameter_min": estimated_diameter_min,
-            "estimated_diameter_max": estimated_diameter_max,
-            "relative_velocity": relative_velocity,
-            "miss_distance": miss_distance
+            "estimated_diameter_min": d_min,
+            "estimated_diameter_max": d_max,
+            "relative_velocity": vel,
+            "miss_distance": dist
         }
         result = await _ml_predict_fn(params)
         return json.dumps({
@@ -431,8 +446,8 @@ class LangGraphAgentService:
             model=CHAT_MODEL,
             openai_api_key=OPENROUTER_API_KEY,
             openai_api_base="https://openrouter.ai/api/v1",
-            temperature=0.7,
-            max_tokens=2000
+            temperature=0.3,
+            max_tokens=350
         )
         
         # Bind tools to LLM
